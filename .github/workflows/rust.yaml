@@ -1,0 +1,187 @@
+# .github/workflows/rust.yaml
+# ─────────────────────────────────────────────────────────────────────
+# s3-put — CI pipeline for musl-static Rust builds
+# ─────────────────────────────────────────────────────────────────────
+# Action versions pinned to Node.js 24 runtimes (June 2026):
+#   actions/checkout          v6  (Node 24)
+#   actions/cache             v5  (Node 24, runner ≥ 2.327.1)
+#   actions/upload-artifact   v7  (Node 24)
+#   actions/download-artifact v6  (Node 24)
+# ─────────────────────────────────────────────────────────────────────
+name: Rust CI — musl-static
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  TARGET: x86_64-unknown-linux-musl
+
+permissions:
+  contents: read
+
+jobs:
+  # ── 1. Lint & format ──────────────────────────────────────────────
+  #  clippy --all-targets compiles the crate, so aws-lc-sys's cc-rs
+  #  build script needs musl-gcc on PATH.
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: ${{ env.TARGET }}
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lint-${{ runner.os }}-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            lint-${{ runner.os }}-${{ env.TARGET }}-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all targets)
+        run: cargo clippy --all-targets --target ${{ env.TARGET }} -- -D warnings
+
+  # ── 2. Build (musl-static release) ───────────────────────────────
+  build:
+    name: Build (musl-static release)
+    runs-on: ubuntu-24.04
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: build-${{ runner.os }}-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            build-${{ runner.os }}-${{ env.TARGET }}-
+
+      - name: Build release
+        run: cargo build --release --target ${{ env.TARGET }}
+
+      - name: Verify static linkage
+        run: |
+          echo "--- ldd ---"
+          ! ldd target/${{ env.TARGET }}/release/s3-put 2>&1 | grep -q "=>"
+          echo "Binary is statically linked ✓"
+          echo "--- file ---"
+          file target/${{ env.TARGET }}/release/s3-put
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: s3-put-musl-static
+          path: target/${{ env.TARGET }}/release/s3-put
+          if-no-files-found: error
+          retention-days: 14
+
+  # ── 3. Test (unit + doc tests) ────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ runner.os }}-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            test-${{ runner.os }}-${{ env.TARGET }}-
+
+      - name: Run tests
+        run: cargo test --target ${{ env.TARGET }}
+
+  # ── 4. Audit (supply-chain CVE scan) ──────────────────────────────
+  audit:
+    name: Supply-Chain Audit
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo-audit
+        run: cargo audit
+
+  # ── 5. SBOM generation (CycloneDX) ───────────────────────────────
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      - name: Generate SBOM
+        run: cargo cyclonedx --format json --override-filename sbom-cyclonedx
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom-cyclonedx
+          path: "*.json"
+          if-no-files-found: warn
+          retention-days: 90
