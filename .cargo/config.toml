@@ -1,0 +1,8 @@
+# .cargo/config.toml — default to musl-static for this workspace
+[build]
+target = "x86_64-unknown-linux-musl"
+
+[target.x86_64-unknown-linux-musl]
+# musl-gcc wrapper must be on $PATH (apt install musl-tools on Debian/Ubuntu)
+#linker = "musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
