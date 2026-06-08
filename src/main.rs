@@ -3,13 +3,13 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use aws_sdk_s3::Client;
 use aws_smithy_http_client::tls;
 use aws_smithy_types::byte_stream::Length;
 use aws_smithy_types::timeout::TimeoutConfig;
@@ -24,13 +24,13 @@ use uuid::Uuid;
 
 const DEFAULT_REGION: &str = "us-east-1";
 const CONNECT_TIMEOUT_SECS: u64 = 10;
-const OPERATION_TIMEOUT_SECS: u64 = 300;   // uploads can be large
+const OPERATION_TIMEOUT_SECS: u64 = 300; // uploads can be large
 const ATTEMPT_TIMEOUT_SECS: u64 = 120;
-const MAX_CONFIG_SIZE: u64 = 1_048_576;     // 1 MiB
+const MAX_CONFIG_SIZE: u64 = 1_048_576; // 1 MiB
 const MAX_CA_BUNDLE_SIZE: u64 = 10_485_760; // 10 MiB
 const MAX_TARGET_LEN: usize = 2048;
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024; // 5 MiB — S3 minimum
-const MAX_PARTS: u64 = 10_000;              // S3 maximum
+const MAX_PARTS: u64 = 10_000; // S3 maximum
 
 // ──────────────────────────────────────────────
 //  CLI
@@ -172,6 +172,24 @@ struct AuditCompleteRecord<'a> {
 }
 
 // ──────────────────────────────────────────────
+//  Multipart upload context
+// ──────────────────────────────────────────────
+
+/// Bundles shared parameters for multipart upload functions,
+/// avoiding clippy::too_many_arguments.
+struct UploadContext<'a> {
+    client: &'a Client,
+    bucket: &'a str,
+    key: &'a str,
+    source_path: &'a Path,
+    file_size: u64,
+    content_type: &'a str,
+    storage_class: Option<&'a str>,
+    part_size: u64,
+    verbose: bool,
+}
+
+// ──────────────────────────────────────────────
 //  Helpers
 // ──────────────────────────────────────────────
 
@@ -187,8 +205,8 @@ fn config_path(override_path: Option<&PathBuf>) -> Result<PathBuf> {
 #[cfg(unix)]
 fn check_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("cannot stat {}", path.display()))?;
+    let meta =
+        std::fs::metadata(path).with_context(|| format!("cannot stat {}", path.display()))?;
     let mode = meta.mode();
     if mode & 0o077 != 0 {
         bail!(
@@ -209,8 +227,8 @@ fn check_permissions(_path: &Path) -> Result<()> {
 
 fn load_config(path: &Path) -> Result<McConfig> {
     // CWE-400 / SI-10: enforce config file size limit
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("cannot stat {}", path.display()))?;
+    let meta =
+        std::fs::metadata(path).with_context(|| format!("cannot stat {}", path.display()))?;
     if meta.len() > MAX_CONFIG_SIZE {
         bail!(
             "config file {} exceeds maximum allowed size ({} bytes)",
@@ -276,34 +294,34 @@ fn resolve_path_style(alias: &McAlias) -> bool {
 /// Detect content-type from file extension.
 fn content_type_from_ext(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
-        Some("json")                  => "application/json",
-        Some("jsonl" | "ndjson")      => "application/x-ndjson",
-        Some("csv")                   => "text/csv",
-        Some("tsv")                   => "text/tab-separated-values",
-        Some("txt" | "log" | "md")    => "text/plain",
-        Some("html" | "htm")          => "text/html",
-        Some("xml")                   => "application/xml",
-        Some("pdf")                   => "application/pdf",
-        Some("png")                   => "image/png",
-        Some("jpg" | "jpeg")          => "image/jpeg",
-        Some("gif")                   => "image/gif",
-        Some("svg")                   => "image/svg+xml",
-        Some("webp")                  => "image/webp",
-        Some("gz" | "gzip")           => "application/gzip",
-        Some("tar")                   => "application/x-tar",
-        Some("zip")                   => "application/zip",
-        Some("zst" | "zstd")         => "application/zstd",
-        Some("bz2")                   => "application/x-bzip2",
-        Some("xz")                    => "application/x-xz",
-        Some("7z")                    => "application/x-7z-compressed",
-        Some("parquet")               => "application/vnd.apache.parquet",
-        Some("avro")                  => "application/avro",
-        Some("orc")                   => "application/x-orc",
-        Some("yaml" | "yml")          => "application/yaml",
-        Some("toml")                  => "application/toml",
-        Some("wasm")                  => "application/wasm",
-        Some("bin" | "dat")           => "application/octet-stream",
-        _                             => "application/octet-stream",
+        Some("json") => "application/json",
+        Some("jsonl" | "ndjson") => "application/x-ndjson",
+        Some("csv") => "text/csv",
+        Some("tsv") => "text/tab-separated-values",
+        Some("txt" | "log" | "md") => "text/plain",
+        Some("html" | "htm") => "text/html",
+        Some("xml") => "application/xml",
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("webp") => "image/webp",
+        Some("gz" | "gzip") => "application/gzip",
+        Some("tar") => "application/x-tar",
+        Some("zip") => "application/zip",
+        Some("zst" | "zstd") => "application/zstd",
+        Some("bz2") => "application/x-bzip2",
+        Some("xz") => "application/x-xz",
+        Some("7z") => "application/x-7z-compressed",
+        Some("parquet") => "application/vnd.apache.parquet",
+        Some("avro") => "application/avro",
+        Some("orc") => "application/x-orc",
+        Some("yaml" | "yml") => "application/yaml",
+        Some("toml") => "application/toml",
+        Some("wasm") => "application/wasm",
+        Some("bin" | "dat") => "application/octet-stream",
+        _ => "application/octet-stream",
     }
 }
 
@@ -356,7 +374,7 @@ async fn run() -> Result<()> {
 
     // Validate multipart constraints
     if file_size > multipart_threshold {
-        let chunk_count = (file_size + part_size - 1) / part_size;
+        let chunk_count = file_size.div_ceil(part_size);
         if chunk_count > MAX_PARTS {
             bail!(
                 "file requires {} parts but S3 maximum is {}. \
@@ -405,10 +423,9 @@ async fn run() -> Result<()> {
     };
 
     // ── 3. Build HTTPS client with PQ KX ────────
-    let mut builder = aws_smithy_http_client::Builder::new()
-        .tls_provider(tls::Provider::Rustls(
-            tls::rustls_provider::CryptoMode::AwsLc,
-        ));
+    let mut builder = aws_smithy_http_client::Builder::new().tls_provider(tls::Provider::Rustls(
+        tls::rustls_provider::CryptoMode::AwsLc,
+    ));
 
     if let Some(ca_path) = &args.ca_bundle {
         let ca_meta = std::fs::metadata(ca_path)
@@ -423,8 +440,7 @@ async fn run() -> Result<()> {
         let pem = std::fs::read(ca_path)
             .with_context(|| format!("failed to read CA bundle {}", ca_path.display()))?;
 
-        let trust_store = tls::TrustStore::default()
-            .with_pem_certificate(pem);
+        let trust_store = tls::TrustStore::default().with_pem_certificate(pem);
 
         let tls_ctx = tls::TlsContext::builder()
             .with_trust_store(trust_store)
@@ -494,18 +510,18 @@ async fn run() -> Result<()> {
 
     // ── 6. Upload ───────────────────────────────
     let (etag, parts_count) = if file_size > multipart_threshold {
-        do_multipart_upload(
-            &client,
-            &bucket,
-            &key,
+        let ctx = UploadContext {
+            client: &client,
+            bucket: &bucket,
+            key: &key,
             source_path,
             file_size,
-            &content_type,
-            args.storage_class.as_deref(),
+            content_type: &content_type,
+            storage_class: args.storage_class.as_deref(),
             part_size,
-            args.verbose,
-        )
-        .await?
+            verbose: args.verbose,
+        };
+        do_multipart_upload(&ctx).await?
     } else {
         let etag = do_single_upload(
             &client,
@@ -593,10 +609,7 @@ async fn do_single_upload(
         }
     })?;
 
-    let etag = resp
-        .e_tag()
-        .unwrap_or_default()
-        .to_string();
+    let etag = resp.e_tag().unwrap_or_default().to_string();
 
     Ok(etag)
 }
@@ -605,33 +618,24 @@ async fn do_single_upload(
 //  Multipart upload
 // ──────────────────────────────────────────────
 
-async fn do_multipart_upload(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-    source_path: &Path,
-    file_size: u64,
-    content_type: &str,
-    storage_class: Option<&str>,
-    part_size: u64,
-    verbose: bool,
-) -> Result<(String, Option<u64>)> {
+async fn do_multipart_upload(ctx: &UploadContext<'_>) -> Result<(String, Option<u64>)> {
     // ── Create multipart upload ─────────────────
-    let mut create_req = client
+    let mut create_req = ctx
+        .client
         .create_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .content_type(content_type);
+        .bucket(ctx.bucket)
+        .key(ctx.key)
+        .content_type(ctx.content_type);
 
-    if let Some(sc) = storage_class {
+    if let Some(sc) = ctx.storage_class {
         create_req = create_req.storage_class(aws_sdk_s3::types::StorageClass::from(sc));
     }
 
     let create_resp = create_req.send().await.with_context(|| {
-        if verbose {
+        if ctx.verbose {
             format!(
                 "CreateMultipartUpload failed: bucket={} key={}",
-                bucket, key,
+                ctx.bucket, ctx.key,
             )
         } else {
             "CreateMultipartUpload request failed".to_string()
@@ -644,17 +648,7 @@ async fn do_multipart_upload(
         .to_string();
 
     // ── Upload parts ────────────────────────────
-    let result = upload_parts(
-        client,
-        bucket,
-        key,
-        &upload_id,
-        source_path,
-        file_size,
-        part_size,
-        verbose,
-    )
-    .await;
+    let result = upload_parts(ctx, &upload_id).await;
 
     match result {
         Ok(completed_parts) => {
@@ -665,29 +659,27 @@ async fn do_multipart_upload(
                 .set_parts(Some(completed_parts))
                 .build();
 
-            let complete_resp = client
+            let complete_resp = ctx
+                .client
                 .complete_multipart_upload()
-                .bucket(bucket)
-                .key(key)
+                .bucket(ctx.bucket)
+                .key(ctx.key)
                 .upload_id(&upload_id)
                 .multipart_upload(completed)
                 .send()
                 .await
                 .with_context(|| {
-                    if verbose {
+                    if ctx.verbose {
                         format!(
                             "CompleteMultipartUpload failed: bucket={} key={} upload_id={}",
-                            bucket, key, upload_id,
+                            ctx.bucket, ctx.key, upload_id,
                         )
                     } else {
                         "CompleteMultipartUpload request failed".to_string()
                     }
                 })?;
 
-            let etag = complete_resp
-                .e_tag()
-                .unwrap_or_default()
-                .to_string();
+            let etag = complete_resp.e_tag().unwrap_or_default().to_string();
 
             Ok((etag, Some(total_parts)))
         }
@@ -695,13 +687,14 @@ async fn do_multipart_upload(
             // ── Abort on failure ─────────────────
             eprintln!(
                 "{{\"event\":\"multipart_abort\",\"upload_id\":\"{}\",\"bucket\":\"{}\",\"key\":\"{}\"}}",
-                upload_id, bucket, key,
+                upload_id, ctx.bucket, ctx.key,
             );
 
-            let _ = client
+            let _ = ctx
+                .client
                 .abort_multipart_upload()
-                .bucket(bucket)
-                .key(key)
+                .bucket(ctx.bucket)
+                .key(ctx.key)
                 .upload_id(&upload_id)
                 .send()
                 .await;
@@ -712,45 +705,34 @@ async fn do_multipart_upload(
 }
 
 /// Upload file in chunks and return the completed parts vector.
-async fn upload_parts(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-    upload_id: &str,
-    source_path: &Path,
-    file_size: u64,
-    part_size: u64,
-    verbose: bool,
-) -> Result<Vec<CompletedPart>> {
-    let mut chunk_count = file_size / part_size;
-    let mut last_chunk_size = file_size % part_size;
+async fn upload_parts(ctx: &UploadContext<'_>, upload_id: &str) -> Result<Vec<CompletedPart>> {
+    let mut chunk_count = ctx.file_size / ctx.part_size;
+    let mut last_chunk_size = ctx.file_size % ctx.part_size;
 
     // If the file divides evenly, the last chunk is a full part
     if last_chunk_size == 0 {
-        last_chunk_size = part_size;
-        if chunk_count > 0 {
-            chunk_count -= 1;
-        }
+        last_chunk_size = ctx.part_size;
+        chunk_count = chunk_count.saturating_sub(1);
     }
     let total_chunks = chunk_count + 1;
 
     // Handle zero-byte edge case (shouldn't reach here, but be safe)
-    if file_size == 0 {
+    if ctx.file_size == 0 {
         bail!("cannot multipart-upload a zero-byte file");
     }
 
     let mut completed_parts: Vec<CompletedPart> = Vec::with_capacity(total_chunks as usize);
 
     for chunk_index in 0..total_chunks {
-        let offset = chunk_index * part_size;
+        let offset = chunk_index * ctx.part_size;
         let this_chunk = if chunk_index == total_chunks - 1 {
             last_chunk_size
         } else {
-            part_size
+            ctx.part_size
         };
 
         let stream = ByteStream::read_from()
-            .path(source_path)
+            .path(ctx.source_path)
             .offset(offset)
             .length(Length::Exact(this_chunk))
             .build()
@@ -759,27 +741,28 @@ async fn upload_parts(
                 format!(
                     "failed to read chunk {} from {}",
                     chunk_index + 1,
-                    source_path.display(),
+                    ctx.source_path.display(),
                 )
             })?;
 
         // S3 part numbers are 1-based
         let part_number = (chunk_index as i32) + 1;
 
-        let upload_resp = client
+        let upload_resp = ctx
+            .client
             .upload_part()
-            .bucket(bucket)
-            .key(key)
+            .bucket(ctx.bucket)
+            .key(ctx.key)
             .upload_id(upload_id)
             .part_number(part_number)
             .body(stream)
             .send()
             .await
             .with_context(|| {
-                if verbose {
+                if ctx.verbose {
                     format!(
                         "UploadPart {} failed: bucket={} key={} upload_id={}",
-                        part_number, bucket, key, upload_id,
+                        part_number, ctx.bucket, ctx.key, upload_id,
                     )
                 } else {
                     format!("UploadPart {} failed", part_number)
