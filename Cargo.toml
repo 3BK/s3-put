@@ -1,0 +1,39 @@
+[package]
+name    = "s3-put"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# ── AWS SDK ──────────────────────────────────────────────────────
+aws-config = { version = "1", default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+    "default-https-client",
+] }
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+    "default-https-client",
+] }
+aws-credential-types = "1"
+aws-smithy-types     = "1"
+
+# ── TLS: explicit http-client builder + PQ preference ────────────
+aws-smithy-http-client = { version = "1", features = [
+    "default-client",
+    "rustls-aws-lc",
+] }
+rustls = { version = "0.23", features = [
+    "aws_lc_rs",
+    "prefer-post-quantum",      # X25519MLKEM768 highest-priority KX
+] }
+
+# ── Runtime / serialization / CLI ────────────────────────────────
+tokio      = { version = "1", features = ["full"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap       = { version = "4", features = ["derive", "env"] }
+anyhow     = "1"
+dirs       = "6"
+secrecy    = { version = "0.10", features = ["serde"] }
+uuid       = { version = "1", features = ["v7"] }
