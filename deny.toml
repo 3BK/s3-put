@@ -77,6 +77,9 @@ allow = [
     # aws-lc is dual-licensed Apache-2.0 OR ISC, but the sys crate
     # bundles OpenSSL-derived code under the OpenSSL license.
     "OpenSSL",
+    
+    # Mozilla License
+    "MPL-2.0",
 ]
 
 # ── Per-crate license exceptions ─────────────────────────────────────
