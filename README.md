@@ -1,6 +1,6 @@
 # s3-put
 
-> **MinIO-compatible S3 file uploader with structured JSONL output, optional KMAC512-384 integrity tagging, and post-quantum TLS.**
+> **MinIO-compatible S3 file uploader with structured JSONL output, optional KMAC256 integrity tagging, and post-quantum TLS.**
 
 `s3-put` is a Rust CLI tool that reads `~/.mc/config.json` (MinIO Client
 configuration) and performs the equivalent of:
@@ -25,7 +25,7 @@ compliance-auditable environments.
 - [Usage](#usage)
 - [Key Resolution](#key-resolution)
 - [Upload Strategy](#upload-strategy)
-- [KMAC512-384 Integrity Tagging](#kmac512-384-integrity-tagging)
+- [KMAC256 Integrity Tagging](#kmac256-integrity-tagging)
 - [Output Schema](#output-schema)
 - [TLS and Post-Quantum Key Exchange](#tls-and-post-quantum-key-exchange)
 - [FIPS 140-2/3 Mode](#fips-140-23-mode)
@@ -56,10 +56,10 @@ compliance-auditable environments.
   multipart upload is aborted to prevent orphaned parts.
 - **Content-type auto-detection** — detects MIME type from file extension;
   overridable via `--content-type`.
-- **Optional KMAC512-384 integrity tagging** — when `--kmac-key` is provided,
-  the file is hashed with KMAC512 (NIST SP 800-185) truncated to 384 bits
-  before upload, and the base64-encoded result is attached as
-  `x-amz-meta-kmac512-384` object metadata.  The tag is preserved by
+- **Optional KMAC256 integrity tagging** — when `--kmac-key` is provided,
+  the file is hashed with NIST SP 800-185 KMAC256 (standard 512-bit output,
+  256-bit security) before upload, and the base64-encoded result is attached
+  as `x-amz-meta-kmac256` object metadata.  The tag is preserved by
   `CopyObject` and `s3-mv`.
 - **Post-quantum TLS** — prefers X25519MLKEM768 (hybrid ML-KEM-768 + X25519)
   during TLS 1.3 handshake via `rustls` + `aws-lc-rs`.
@@ -70,7 +70,7 @@ compliance-auditable environments.
   required).
 - **Audit logging** — emits JSONL audit records (startup, completion, abort) to
   stderr with a UUID v7 `run_id` for correlation.  Includes `kmac_attached`
-  indicator and `kmac512_384` value in completion record.
+  indicator and `kmac256` value in completion record.
 - **Input validation** — enforces maximum lengths on target strings, config
   files, CA bundles, part counts, and validates KMAC key hex encoding upfront.
 - **Timeouts** — connect (10 s), operation (300 s), and per-attempt (120 s)
@@ -168,7 +168,7 @@ s3-put ./report.pdf myminio/docs-bucket/
 s3-put ./report.pdf myminio/docs-bucket/2026/Q2/quarterly-report.pdf
 ```
 
-### Upload with KMAC512-384 integrity tag
+### Upload with KMAC256 integrity tag
 
 ```bash
 s3-put ./sensors.parquet myminio/telemetry-bucket/raw/2026/06/09/ \
@@ -205,17 +205,17 @@ s3-put ./data.json myminio/internal-bucket/ \
   --ca-bundle /etc/pki/tls/certs/internal-ca.pem
 ```
 
-### Verify KMAC metadata after upload
+### Verify KMAC256 metadata after upload
 
 ```bash
 mc stat --json myminio/telemetry-bucket/raw/2026/06/09/sensors.parquet \
-  | jq '.metadata["X-Amz-Meta-Kmac512-384"]'
+  | jq '.metadata["X-Amz-Meta-Kmac256"]'
 ```
 
 ### Pipe result to jq
 
 ```bash
-s3-put ./metrics.parquet myminio/analytics/ | jq '{etag, kmac512_384}'
+s3-put ./metrics.parquet myminio/analytics/ | jq '{etag, kmac256}'
 ```
 
 ### CLI reference
@@ -238,7 +238,7 @@ Options:
       --part-size-mib <N>              Part size for multipart [default: 10]
       --ca-bundle <PATH>               PEM CA bundle to add to native roots
       --verbose                        Emit detailed error information
-      --kmac-key <HEX_KEY>             KMAC512-384 key (hex-encoded, optional)
+      --kmac-key <HEX_KEY>             KMAC256 key (hex-encoded, optional)
       --kmac-custom <STRING>           KMAC customization string [default: ""]
   -h, --help                           Print help
 ```
@@ -277,31 +277,45 @@ before starting the upload and advises increasing `--part-size-mib` if needed.
 
 ---
 
-## KMAC512-384 Integrity Tagging
+## KMAC256 Integrity Tagging
 
 ### Overview
 
-When `--kmac-key` is provided, `s3-put` computes a KMAC512 (NIST SP 800-185)
-hash of the source file, truncated to 384 bits (48 bytes), and attaches the
-base64-encoded result as `x-amz-meta-kmac512-384` on the uploaded object.
+When `--kmac-key` is provided, `s3-put` computes a NIST SP 800-185 KMAC256
+hash of the source file with the **standard 512-bit output** (no truncation)
+and attaches the base64-encoded result as `x-amz-meta-kmac256` on the
+uploaded object.
 
 This provides a **keyed integrity tag** that:
 
 - Can be verified by any party that holds the KMAC key
 - Is preserved by `CopyObject` (`metadata_directive: COPY`) and `s3-mv`
 - Travels with the object as S3 user-defined metadata
-- Uses a NIST-standardized post-quantum-aligned construction
+- Uses a NIST-standardized construction with 256-bit security
+
+### Cryptographic properties
+
+| Property | Value |
+|----------|-------|
+| NIST standard | SP 800-185 (KMAC) |
+| Variant | KMAC256 (`Kmac::v256`) |
+| Underlying primitive | Keccak-1600 (sponge, capacity 512) |
+| Security strength | 256-bit classical |
+| Quantum security (Grover) | ~128-bit |
+| Output length | **512 bits (64 bytes) — standard, untruncated** |
+| Base64 output | 88 characters |
+| Domain separation | Built-in customization parameter (S) per SP 800-185 |
 
 ### How it works
 
 ```
-Source file ──► stream in 8 KiB chunks ──► KMAC512(key, customization)
+Source file ──► stream in 8 KiB chunks ──► KMAC256(key, customization)
                                                 │
-                                         finalize to 48 bytes (384 bits)
+                                         finalize to 64 bytes (512 bits)
                                                 │
-                                         base64 encode (64 characters)
+                                         base64 encode (88 characters)
                                                 │
-                                         attach as x-amz-meta-kmac512-384
+                                         attach as x-amz-meta-kmac256
 ```
 
 The file is streamed through the KMAC — never fully buffered in memory.
@@ -309,8 +323,8 @@ The file is streamed through the KMAC — never fully buffered in memory.
 ### When `--kmac-key` is NOT provided
 
 - No KMAC computation occurs
-- No `x-amz-meta-kmac512-384` metadata is attached
-- `kmac512_384` is omitted from the JSON output
+- No `x-amz-meta-kmac256` metadata is attached
+- `kmac256` is omitted from the JSON output
 - `kmac_attached: false` in the audit start record
 - Zero runtime cost — the KMAC code path is not executed
 
@@ -324,33 +338,21 @@ The file is streamed through the KMAC — never fully buffered in memory.
 | Key rotation | Rotate periodically.  Objects tagged with old keys remain verifiable if you retain the old key. |
 | Customization string | Use for domain separation (e.g., `"durham-telemetry-v2"`).  Different customization strings produce different tags even with the same key and file. |
 
-### Why KMAC512-384
-
-| Property | Value |
-|----------|-------|
-| NIST standard | SP 800-185 |
-| Underlying primitive | Keccak (sponge construction) |
-| Classical security | 256-bit |
-| Quantum security (Grover) | ~192-bit |
-| Domain separation | Built-in customization parameter (S) |
-| Output flexibility | XOF — truncation is spec-defined |
-| Base64 output length | 64 characters (fits S3 metadata limits) |
-
 ### Verifying the tag
 
 ```bash
 # After upload — read the tag from object metadata
-mc stat --json alias/bucket/key | jq -r '.metadata["X-Amz-Meta-Kmac512-384"]'
+mc stat --json alias/bucket/key | jq -r '.metadata["X-Amz-Meta-Kmac256"]'
 
-# Recompute locally (using any KMAC512 implementation)
-# and compare the base64 strings
+# Recompute locally (using any KMAC256 implementation with standard
+# 512-bit output) and compare the base64 strings
 ```
 
 ---
 
 ## Output Schema
 
-### Upload result (stdout)
+### Upload result with KMAC256 (stdout)
 
 ```json
 {
@@ -363,7 +365,7 @@ mc stat --json alias/bucket/key | jq -r '.metadata["X-Amz-Meta-Kmac512-384"]'
   "etag": "\"d41d8cd98f00b204e9800998ecf8427e\"",
   "content_type": "text/csv",
   "upload_method": "single",
-  "kmac512_384": "RkFLRV9CQVNFNF9TVFJJTkdfSEVSRV9GT1JfREVNT05TVFJBVEFUSU9O",
+  "kmac256": "RkFLRV9CQVNFNF9TVFJJTkdfSEVSRV9GT1JfREVNT05TVFJBVEFUSU9ORkFLRV9CQVNFNF9TVFJJTkdfSEVSRQ==",
   "duration_ms": 347
 }
 ```
@@ -385,7 +387,7 @@ mc stat --json alias/bucket/key | jq -r '.metadata["X-Amz-Meta-Kmac512-384"]'
 }
 ```
 
-> **Note:** `kmac512_384` is omitted entirely when `--kmac-key` is not used.
+> **Note:** `kmac256` is omitted entirely when `--kmac-key` is not used.
 
 ### Error record (stderr)
 
@@ -410,7 +412,7 @@ mc stat --json alias/bucket/key | jq -r '.metadata["X-Amz-Meta-Kmac512-384"]'
 | `content_type`  | string | on success       | MIME type used for upload                |
 | `upload_method` | string | on success       | `"single"` or `"multipart"`             |
 | `parts`         | u64    | multipart only   | Number of parts uploaded                 |
-| `kmac512_384`   | string | when `--kmac-key` used | Base64-encoded KMAC512-384 tag     |
+| `kmac256`       | string | when `--kmac-key` used | Base64-encoded KMAC256 tag (88 chars) |
 | `duration_ms`   | u128   | on success       | Total upload duration in milliseconds    |
 | `error`         | string | on error         | Human-readable error description         |
 
@@ -421,12 +423,6 @@ mc stat --json alias/bucket/key | jq -r '.metadata["X-Amz-Meta-Kmac512-384"]'
 The application uses **rustls** with the **aws-lc-rs** cryptographic provider.
 The `prefer-post-quantum` feature ensures **X25519MLKEM768** is offered first
 during TLS 1.3 handshake.
-
-### Negotiation behaviour
-
-1. Client offers X25519MLKEM768 first in `supported_groups`.
-2. If supported, the handshake completes with hybrid PQ key exchange.
-3. If not supported, falls back to X25519, then secp256r1/secp384r1.
 
 ### Verification
 
@@ -472,10 +468,11 @@ Requires a Go toolchain (>= 1.22) at build time.
 
 | Control                    | Implementation                                              |
 |----------------------------|-------------------------------------------------------------|
-| KMAC512-384 (optional)     | Keyed integrity tag via NIST SP 800-185 KMAC construction   |
+| KMAC256 (optional)         | Keyed integrity tag via NIST SP 800-185 KMAC256             |
+| Standard output            | 512-bit (64-byte) output — no truncation                    |
 | Streaming hash             | File streamed in 8 KiB chunks — never fully buffered        |
 | Key validation             | Hex key decoded and validated before any S3 calls           |
-| Metadata attachment        | `x-amz-meta-kmac512-384` — preserved by CopyObject/s3-mv   |
+| Metadata attachment        | `x-amz-meta-kmac256` — preserved by CopyObject / s3-mv     |
 | Zero cost when unused      | No computation or metadata when `--kmac-key` is not passed  |
 
 ### Input validation
@@ -518,7 +515,7 @@ Requires a Go toolchain (>= 1.22) at build time.
 | X25519MLKEM768 PQ KX          | SC-8(1)       | A.8.24    | 4.2.1       | V-222610   | 3.10     |
 | FIPS mode (optional)          | SC-13         | A.8.24    | 4.2.1       | V-222596   | 3.10     |
 | CA bundle add (not replace)   | SC-23         | A.8.24    | 4.2.1       | V-222577   | 3.10     |
-| KMAC512-384 integrity tag     | SI-7          | A.8.24    | 6.2.4       | V-222542   | 3.11     |
+| KMAC256 integrity tag         | SI-7          | A.8.24    | 6.2.4       | V-222542   | 3.11     |
 
 ### Audit and logging
 
@@ -580,14 +577,15 @@ All audit records are emitted to **stderr** as JSONL.  Each record includes a
   "size": 1048576,
   "etag": "\"d41d8cd98f00b204e9800998ecf8427e\"",
   "upload_method": "single",
-  "kmac512_384": "RkFLRV9CQVNFNF9TVFJJTkdfSEVSRV9GT1JfREVNT05TVFJBVEFUSU9O",
+  "kmac256": "RkFLRV9CQVNFNF9TVFJJTkdfSEVSRV9GT1JfREVNT05TVFJBVEFUSU9ORkFLRV9CQVNFNF9TVFJJTkdfSEVSRQ==",
   "duration_ms": 523,
   "outcome": "success"
 }
 ```
 
-> **Note:** `kmac512_384` is omitted from the completion record when
-> `--kmac-key` is not used.
+> **Note:** `kmac256` is omitted from the completion record when
+> `--kmac-key` is not used.  The KMAC **key** and **customization string**
+> are **never** logged.
 
 ### Log integrity
 
@@ -632,12 +630,12 @@ The underlying HTTP client respects:
 
 ### v0.3.0 (2026-06-09)
 
-- **Added:** Optional KMAC512-384 integrity tagging via `--kmac-key` and
-  `--kmac-custom`.  Computes NIST SP 800-185 KMAC512 truncated to 384 bits
-  over the source file and attaches the base64-encoded result as
-  `x-amz-meta-kmac512-384` object metadata.
+- **Added:** Optional KMAC256 integrity tagging via `--kmac-key` and
+  `--kmac-custom`.  Computes NIST SP 800-185 KMAC256 with standard 512-bit
+  output (no truncation, 256-bit security) over the source file and attaches
+  the base64-encoded result as `x-amz-meta-kmac256` object metadata.
 - **Added:** `tiny-keccak`, `base64`, and `hex` dependencies.
-- **Added:** `kmac512_384` field in `UploadRecord` and `AuditCompleteRecord`.
+- **Added:** `kmac256` field in `UploadRecord` and `AuditCompleteRecord`.
 - **Added:** `kmac_attached` field in `AuditStartRecord`.
 - **Added:** `kmac_b64` field in `UploadContext` for multipart uploads.
 - **Added:** `mimalloc` (secure mode) as global allocator.
