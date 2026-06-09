@@ -1,5 +1,6 @@
 # deny.toml — cargo-deny configuration for s3-put
 # ─────────────────────────────────────────────────────────────────────
+# Format: cargo-deny 0.19.x
 # Reference: https://embarkstudios.github.io/cargo-deny/checks/index.html
 # ─────────────────────────────────────────────────────────────────────
 # Last reviewed: 2026-06-09
@@ -7,7 +8,6 @@
 # ── General ──────────────────────────────────────────────────────────
 
 [graph]
-# Lint the entire dependency graph including build and dev dependencies.
 all-features = false
 no-default-features = false
 targets = [
@@ -16,16 +16,24 @@ targets = [
 
 # ── Advisories ───────────────────────────────────────────────────────
 # Checks crates against the RustSec advisory database.
+#
+# In cargo-deny >= 0.16, the old severity-level fields (vulnerability,
+# unsound, notice, severity-threshold) have been removed.  All
+# vulnerability and unsound advisories now always emit errors.
+# Only `unmaintained` and `yanked` remain configurable.
 
 [advisories]
-# Fail the build on any known vulnerability.
-vulnerability = "deny"
-# Warn on unmaintained crates (no release in > 1 year).
-unmaintained = "warn"
-# Warn on crates that have been yanked from crates.io.
+# Scope for unmaintained advisories.  Values:
+#   "all"        — error on any unmaintained crate
+#   "workspace"  — error only for workspace crates
+#   "transitive" — error only for transitive deps
+#   "none"       — do not check
+unmaintained = "workspace"
+
+# What happens when a yanked crate version is encountered.
+# "deny" | "warn" | "allow"
 yanked = "warn"
-# Warn if the advisory database hasn't been updated recently.
-notice = "warn"
+
 # Ignore specific advisories (use sparingly, with justification).
 ignore = [
     # Example:
@@ -35,19 +43,20 @@ ignore = [
 # ── Licenses ─────────────────────────────────────────────────────────
 # Controls which licenses are permitted in the dependency tree.
 #
-# The Rust/AWS ecosystem overwhelmingly uses MIT, Apache-2.0, and
-# BSD-variant licenses.  The list below covers every license observed
-# in the s3-put dependency tree as of June 2026.
+# In cargo-deny >= 0.16, the old fields (unlicensed, deny, copyleft,
+# allow-osi-fsf-free, default) have been removed.  All licenses are
+# denied unless explicitly listed in `allow`.  Use `[[licenses.exceptions]]`
+# for per-crate overrides and `[[licenses.clarify]]` for crates with
+# non-machine-readable license files.
 
 [licenses]
-# Fail on any crate with no detectable license.
-unlicensed = "deny"
-# Fail on any copyleft license (GPL, LGPL, AGPL, etc.).
-copyleft = "deny"
-# How to handle licenses not in the allow list.
-default = "deny"
+# Warn if an allowed license is never encountered in the dependency tree.
+unused-allowed-license = "warn"
 
-# Licenses that are explicitly permitted.
+# Confidence threshold for license file detection (0.0 – 1.0).
+confidence-threshold = 0.95
+
+# Licenses that are explicitly permitted for all crates.
 allow = [
     # ── Permissive (OSI-approved) ────────────────────────────────────
     "MIT",
@@ -68,27 +77,31 @@ allow = [
     # aws-lc is dual-licensed Apache-2.0 OR ISC, but the sys crate
     # bundles OpenSSL-derived code under the OpenSSL license.
     "OpenSSL",
-
-    # ── Ring (historical) ────────────────────────────────────────────
-    # ring uses a custom ISC-style license that SPDX identifies as
-    # this.  It may appear in transitive deps even with aws-lc-rs.
-    "blessing",
 ]
 
-# Some crates use non-standard license expressions or have licenses
-# that can't be automatically detected.  Clarify them here.
+# ── Per-crate license exceptions ─────────────────────────────────────
+# Use [[licenses.exceptions]] when a specific crate needs a license
+# that you don't want to allow globally.
+#
+# Example:
+# [[licenses.exceptions]]
+# allow = ["MPL-2.0"]
+# name = "some-crate"
+
+# ── License clarifications ───────────────────────────────────────────
+# For crates with non-standard LICENSE files that cargo-deny can't
+# auto-detect.
+
 [[licenses.clarify]]
 name = "ring"
 expression = "MIT AND ISC AND OpenSSL"
 license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
-# If a crate is dual-licensed (e.g., MIT OR Apache-2.0), cargo-deny
-# needs to know which license to evaluate.  This sets the preference
-# order.  We prefer Apache-2.0 for patent grant coverage.
-exceptions = [
-    # Example: if a specific crate needs an exception
-    # { allow = ["MPL-2.0"], name = "some-crate", version = "*" },
-]
+# ── Private crates ───────────────────────────────────────────────────
+# If you have private registry crates, configure them here.
+[licenses.private]
+ignore = false
+registries = []
 
 # ── Bans ─────────────────────────────────────────────────────────────
 # Ban specific crates or control duplicate versions.
