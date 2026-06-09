@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, Instant};
@@ -13,10 +14,13 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_smithy_http_client::tls;
 use aws_smithy_types::byte_stream::Length;
 use aws_smithy_types::timeout::TimeoutConfig;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::Parser;
 use mimalloc::MiMalloc;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use tiny_keccak::{Hasher, Kmac};
 use uuid::Uuid;
 
 #[global_allocator]
@@ -35,6 +39,7 @@ const MAX_CA_BUNDLE_SIZE: u64 = 10_485_760; // 10 MiB
 const MAX_TARGET_LEN: usize = 2048;
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024; // 5 MiB — S3 minimum
 const MAX_PARTS: u64 = 10_000; // S3 maximum
+const KMAC_READ_BUF: usize = 8192; // 8 KiB streaming hash buffer
 
 // ──────────────────────────────────────────────
 //  CLI
@@ -87,6 +92,18 @@ struct Args {
     /// Emit detailed error information.
     #[arg(long, default_value_t = false)]
     verbose: bool,
+
+    /// KMAC512-384 key (hex-encoded) for computing x-amz-meta-kmac512-384.
+    /// If set, the file is hashed with KMAC512 truncated to 384 bits
+    /// before upload, and the base64-encoded result is attached as
+    /// object metadata.  If omitted, no KMAC is computed.
+    #[arg(long, value_name = "HEX_KEY")]
+    kmac_key: Option<String>,
+
+    /// KMAC customization string (SP 800-185 domain separator).
+    /// Only used when --kmac-key is set.  Default: "" (empty).
+    #[arg(long, value_name = "STRING", default_value = "")]
+    kmac_custom: String,
 }
 
 // ──────────────────────────────────────────────
@@ -131,6 +148,8 @@ struct UploadRecord {
     upload_method: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     parts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kmac512_384: Option<String>,
     duration_ms: u128,
 }
 
@@ -155,6 +174,7 @@ struct AuditStartRecord<'a> {
     region: &'a str,
     path_style: bool,
     pq_kx: &'static str,
+    kmac_attached: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     ca_bundle: Option<&'a str>,
 }
@@ -171,6 +191,8 @@ struct AuditCompleteRecord<'a> {
     upload_method: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     parts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kmac512_384: Option<&'a str>,
     duration_ms: u128,
     outcome: &'static str,
 }
@@ -191,6 +213,43 @@ struct UploadContext<'a> {
     storage_class: Option<&'a str>,
     part_size: u64,
     verbose: bool,
+    kmac_b64: Option<&'a str>,
+}
+
+// ──────────────────────────────────────────────
+//  KMAC512-384
+// ──────────────────────────────────────────────
+
+/// Compute KMAC512 truncated to 384 bits (48 bytes) over a file,
+/// returning the result as a base64-encoded string.
+///
+/// - `key`: the KMAC key (shared secret or per-pipeline key)
+/// - `customization`: SP 800-185 domain-separation string (S)
+/// - `path`: file to hash
+///
+/// The file is streamed in 8 KiB chunks — never fully buffered.
+fn kmac512_384_file(key: &[u8], customization: &[u8], path: &Path) -> Result<String> {
+    let mut kmac = Kmac::v512(key, customization);
+
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+
+    let mut buf = [0u8; KMAC_READ_BUF];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("error reading {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        kmac.update(&buf[..n]);
+    }
+
+    // Finalize into 48 bytes (384 bits)
+    let mut output = [0u8; 48];
+    kmac.finalize(&mut output);
+
+    Ok(BASE64.encode(output))
 }
 
 // ──────────────────────────────────────────────
@@ -389,6 +448,16 @@ async fn run() -> Result<()> {
         }
     }
 
+    // ── Compute KMAC512-384 if requested ────────
+    let kmac_b64 = if let Some(ref hex_key) = args.kmac_key {
+        let key_bytes =
+            hex::decode(hex_key).context("invalid hex in --kmac-key")?;
+        let b64 = kmac512_384_file(&key_bytes, args.kmac_custom.as_bytes(), source_path)?;
+        Some(b64)
+    } else {
+        None
+    };
+
     // ── 1. Load mc config ───────────────────────
     let cfg_path = config_path(args.config.as_ref())?;
     check_permissions(&cfg_path)?;
@@ -508,6 +577,7 @@ async fn run() -> Result<()> {
         region: region_str,
         path_style: force_path,
         pq_kx: "X25519MLKEM768",
+        kmac_attached: kmac_b64.is_some(),
         ca_bundle: args.ca_bundle.as_ref().map(|p| p.to_str().unwrap_or("?")),
     };
     eprintln!("{}", serde_json::to_string(&audit_start)?);
@@ -524,6 +594,7 @@ async fn run() -> Result<()> {
             storage_class: args.storage_class.as_deref(),
             part_size,
             verbose: args.verbose,
+            kmac_b64: kmac_b64.as_deref(),
         };
         do_multipart_upload(&ctx).await?
     } else {
@@ -534,6 +605,7 @@ async fn run() -> Result<()> {
             source_path,
             &content_type,
             args.storage_class.as_deref(),
+            kmac_b64.as_deref(),
             args.verbose,
         )
         .await?;
@@ -554,6 +626,7 @@ async fn run() -> Result<()> {
         content_type: content_type.clone(),
         upload_method: upload_method_label,
         parts: parts_count,
+        kmac512_384: kmac_b64.clone(),
         duration_ms,
     };
     println!("{}", serde_json::to_string(&record)?);
@@ -569,6 +642,7 @@ async fn run() -> Result<()> {
         etag: &etag,
         upload_method: upload_method_label,
         parts: parts_count,
+        kmac512_384: kmac_b64.as_deref(),
         duration_ms,
         outcome: "success",
     };
@@ -588,6 +662,7 @@ async fn do_single_upload(
     source_path: &Path,
     content_type: &str,
     storage_class: Option<&str>,
+    kmac_b64: Option<&str>,
     verbose: bool,
 ) -> Result<String> {
     let body = ByteStream::from_path(source_path)
@@ -603,6 +678,10 @@ async fn do_single_upload(
 
     if let Some(sc) = storage_class {
         req = req.storage_class(aws_sdk_s3::types::StorageClass::from(sc));
+    }
+
+    if let Some(kmac) = kmac_b64 {
+        req = req.metadata("kmac512-384", kmac);
     }
 
     let resp = req.send().await.with_context(|| {
@@ -633,6 +712,10 @@ async fn do_multipart_upload(ctx: &UploadContext<'_>) -> Result<(String, Option<
 
     if let Some(sc) = ctx.storage_class {
         create_req = create_req.storage_class(aws_sdk_s3::types::StorageClass::from(sc));
+    }
+
+    if let Some(kmac) = ctx.kmac_b64 {
+        create_req = create_req.metadata("kmac512-384", kmac);
     }
 
     let create_resp = create_req.send().await.with_context(|| {
