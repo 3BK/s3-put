@@ -80,6 +80,9 @@ allow = [
     
     # Mozilla License
     "MPL-2.0",
+    
+    # Creative Commons License
+    "CC0-1.0",
 ]
 
 # ── Per-crate license exceptions ─────────────────────────────────────
