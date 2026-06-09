@@ -450,8 +450,7 @@ async fn run() -> Result<()> {
 
     // ── Compute KMAC512-384 if requested ────────
     let kmac_b64 = if let Some(ref hex_key) = args.kmac_key {
-        let key_bytes =
-            hex::decode(hex_key).context("invalid hex in --kmac-key")?;
+        let key_bytes = hex::decode(hex_key).context("invalid hex in --kmac-key")?;
         let b64 = kmac512_384_file(&key_bytes, args.kmac_custom.as_bytes(), source_path)?;
         Some(b64)
     } else {
