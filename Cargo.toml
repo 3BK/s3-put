@@ -1,6 +1,6 @@
 [package]
 name    = "s3-put"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 
@@ -42,8 +42,12 @@ dirs       = "6"
 secrecy    = { version = "0.10", features = ["serde"] }
 uuid       = { version = "1", features = ["v7"] }
 
+# == milmalloc ============
+#  guard pages, randomized allocation, and encrypted free lists
+mimalloc = { version = "0.1", features = ["secure"] }
+
 [profile.release]
-opt-level = 3
+opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
