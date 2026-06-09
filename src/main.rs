@@ -14,9 +14,13 @@ use aws_smithy_http_client::tls;
 use aws_smithy_types::byte_stream::Length;
 use aws_smithy_types::timeout::TimeoutConfig;
 use clap::Parser;
+use mimalloc::MiMalloc;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 // ──────────────────────────────────────────────
 //  Constants
