@@ -1,6 +1,6 @@
 # Security Policy — s3-put
 
-> **Version:** 0.2.0
+> **Version:** 0.3.0
 > **Last reviewed:** 2026-06-09
 > **Classification:** Internal — Audit-Grade Documentation
 
@@ -14,6 +14,7 @@
 - [Security Architecture](#security-architecture)
 - [Credential Protection](#credential-protection)
 - [Cryptographic Controls](#cryptographic-controls)
+- [KMAC512-384 Integrity Tagging — Security Analysis](#kmac512-384-integrity-tagging--security-analysis)
 - [Input Validation](#input-validation)
 - [Output and Error Handling](#output-and-error-handling)
 - [Audit Logging](#audit-logging)
@@ -32,7 +33,8 @@
 
 | Version | Status    | Security Updates |
 |---------|-----------|------------------|
-| 0.2.x   | Active   | Yes              |
+| 0.3.x   | Active   | Yes              |
+| 0.2.x   | EOL      | No               |
 | 0.1.x   | EOL      | No               |
 
 Only the latest patch release of each minor version receives security updates.
@@ -66,9 +68,11 @@ address the issue before public disclosure.
 | Asset | Description |
 |-------|-------------|
 | HMAC credentials | `accessKey` / `secretKey` in `~/.mc/config.json` |
+| KMAC key | Hex-encoded key passed via `--kmac-key` CLI flag |
 | Data in transit | File content between local filesystem and S3 endpoint |
 | Data at rest (source) | Local files read by the application |
 | Data at rest (remote) | Objects written to S3 buckets |
+| Object integrity tags | `x-amz-meta-kmac512-384` metadata on uploaded objects |
 | Audit trail | JSONL records emitted to stderr |
 | Infrastructure topology | Endpoint URLs, bucket names, alias names, object keys |
 | Multipart upload state | Upload IDs, part ETags during in-progress uploads |
@@ -82,6 +86,10 @@ address the issue before public disclosure.
 │  Source files to upload      │
 ├─────────────────────────────┤
 │  s3-put process             │  ← Trust boundary
+│  ┌────────────────────────┐ │
+│  │ KMAC512-384 compute    │ │  ← New in v0.3.0
+│  │ (streaming, 8 KiB buf) │ │
+│  └────────────────────────┘ │
 ├─────────────────────────────┤
 │  TLS 1.3 (X25519MLKEM768)  │  ← Network boundary
 ├─────────────────────────────┤
@@ -94,12 +102,12 @@ address the issue before public disclosure.
 
 | Actor | Capability | Relevant controls |
 |-------|-----------|-------------------|
-| Local unprivileged user | Read config file, inspect process memory | Config permission check (0600), SecretString zeroing |
+| Local unprivileged user | Read config file, inspect process memory, read /proc/PID/cmdline | Config permission check (0600), SecretString zeroing; KMAC key visible in cmdline (accepted risk) |
 | Network observer (passive) | Capture TLS traffic for later decryption | X25519MLKEM768 PQ KX, TLS 1.3 |
 | Network attacker (active) | MITM, certificate substitution, response injection | CA bundle validation, certificate chain verification |
 | Malicious endpoint | Return crafted responses, manipulate ETags | ETag validation in multipart completion, abort on failure |
 | Supply chain attacker | Compromise a dependency crate | cargo audit, SBOM, dependency pinning |
-| Insider with bucket access | Read uploaded objects, enumerate keys | Out of scope — access control is an S3 policy responsibility |
+| Data integrity attacker | Modify object content after upload | KMAC512-384 tag enables detection — any party with the key can recompute and compare |
 
 ---
 
@@ -113,60 +121,60 @@ address the issue before public disclosure.
     a. Target string length (2,048 chars max)
     b. Part size minimum (5 MiB)
     c. Part count maximum (10,000)
- 3. Validate source file
+    d. KMAC key hex decoding (fail-fast on invalid hex)
+ 3. Compute KMAC512-384 if --kmac-key is set
+    a. Stream source file in 8 KiB chunks through Kmac::v512
+    b. Finalize to 48 bytes (384 bits)
+    c. Base64-encode → 64 characters
+ 4. Validate source file
     a. Must exist and be a regular file
     b. Multipart constraint pre-check
- 4. Load ~/.mc/config.json
+ 5. Load ~/.mc/config.json
     a. Check file permissions (CWE-732)
     b. Enforce file size limit (CWE-400)
     c. Parse JSON → McConfig with SecretString fields
- 5. Resolve alias, bucket, key
+ 6. Resolve alias, bucket, key
     a. Key derivation from source filename if target ends with '/'
     b. Sanitize error messages (CWE-209)
- 6. Build HTTPS client
+ 7. Build HTTPS client
     a. rustls + aws-lc-rs with prefer-post-quantum
     b. Optional CA bundle (additive, not replacing)
- 7. Build S3 client with timeout config
- 8. Emit audit start record to stderr (CWE-778)
- 9. Upload
+ 8. Build S3 client with timeout config
+ 9. Emit audit start record to stderr (CWE-778)
+    a. Includes kmac_attached: true/false
+10. Upload
     a. Single PutObject (file <= threshold)
+       - Attach x-amz-meta-kmac512-384 if computed
     b. Multipart: CreateMultipartUpload → UploadPart × N → CompleteMultipartUpload
+       - Attach x-amz-meta-kmac512-384 on CreateMultipartUpload
     c. On failure: AbortMultipartUpload + audit abort record
-10. Emit result record to stdout
-11. Emit audit completion record to stderr
-12. SecretString fields zeroed on drop (CWE-316)
-13. Process exits
+11. Emit result record to stdout (includes kmac512_384 if computed)
+12. Emit audit completion record to stderr (includes kmac512_384 if computed)
+13. SecretString fields zeroed on drop (CWE-316)
+14. Process exits
 ```
 
 ### Data flow
 
 ```
-Source file ──► ByteStream::from_path() ──────────────────────► PutObject
-                                                                    │
-Source file ──► ByteStream::read_from().offset().length() ──► UploadPart × N
-                                                                    │
-                            SigV4 signing ◄── Credentials ◄── SecretString
-                                   │
-                                   ▼
-                    TLS 1.3 (X25519MLKEM768) ──► S3 endpoint
-                                                      │
-                                                      ▼
-                                              ETag / Upload ID
-                                                      │
-                                                      ▼
-Audit records ──► stderr (JSONL)
-Result record ──► stdout (JSON)
-```
-
-### Single-part vs multipart decision
-
-```
-file_size <= multipart_threshold_mib ?
-    ├── YES → PutObject (single API call)
-    └── NO  → CreateMultipartUpload
-              ├── UploadPart × ceil(file_size / part_size)
-              ├── CompleteMultipartUpload (on success)
-              └── AbortMultipartUpload (on any part failure)
+Source file ──► KMAC512(key, custom) ──► base64 ──► kmac_b64
+                                                       │
+Source file ──► ByteStream::from_path() ──► PutObject ─┤
+                                            .metadata("kmac512-384", kmac_b64)
+                                                       │
+Source file ──► ByteStream::read_from() ──► UploadPart × N
+                                                       │
+                SigV4 signing ◄── Credentials ◄── SecretString
+                       │
+                       ▼
+        TLS 1.3 (X25519MLKEM768) ──► S3 endpoint
+                                          │
+                                          ▼
+                                  ETag / Upload ID
+                                          │
+                                          ▼
+Audit records ──► stderr (JSONL, includes kmac512_384)
+Result record ──► stdout (JSON, includes kmac512_384)
 ```
 
 ---
@@ -192,7 +200,7 @@ config.json ──► serde_json::from_str ──► McAlias.access_key: SecretS
                                               │
                                     Credentials::new(access_key, secret_key, ...)
                                               │
-                                    SigV4 request signing (PutObject / UploadPart)
+                                    SigV4 request signing
                                               │
                                     Drop ──► SecretString::zeroize()
 ```
@@ -202,8 +210,7 @@ config.json ──► serde_json::from_str ──► McAlias.access_key: SecretS
 The `Credentials::new()` call in the AWS SDK accepts `String`, not
 `SecretString`.  This creates a temporary owned `String` that is **not**
 zeroed on drop.  This is an upstream SDK limitation.  In a short-lived CLI
-process, the OS reclaims the memory on exit.  For long-running services,
-consider explicit `zeroize` of the `Credentials` struct.
+process, the OS reclaims the memory on exit.
 
 ---
 
@@ -221,23 +228,89 @@ consider explicit `zeroize` of the `Credentials` struct.
 | Certificate validation | Platform-native roots + optional PEM CA bundle | CWE-295 |
 | FIPS mode | Optional (`--features fips` build) | NIST SP 800-53 SC-13 |
 
-### Post-quantum key exchange
-
-The `prefer-post-quantum` feature on `rustls` places X25519MLKEM768
-(group `0x6399`) first in the TLS 1.3 ClientHello `supported_groups`
-extension.  If the server does not support it, negotiation falls back
-automatically.  No application code changes are required.
-
 ### Signature scheme
 
-All S3 requests are signed with AWS SigV4 (HMAC-SHA256).  The signing
-is performed by the AWS SDK's `aws-sigv4` crate.  This applies to:
+All S3 requests are signed with AWS SigV4 (HMAC-SHA256).
 
-- `PutObject` requests (single-part upload)
-- `CreateMultipartUpload` requests
-- `UploadPart` requests (each part individually signed)
-- `CompleteMultipartUpload` requests
-- `AbortMultipartUpload` requests
+---
+
+## KMAC512-384 Integrity Tagging — Security Analysis
+
+### New in v0.3.0
+
+When `--kmac-key` is provided, `s3-put` computes a KMAC512 (NIST SP 800-185)
+hash of the source file, truncated to 384 bits, and attaches the
+base64-encoded result as `x-amz-meta-kmac512-384` on the uploaded object.
+
+### Cryptographic properties
+
+| Property | Value |
+|----------|-------|
+| NIST standard | SP 800-185 (KMAC) |
+| Underlying primitive | Keccak-1600 (sponge construction) |
+| Classical security | 256-bit (KMAC512) |
+| Quantum security (Grover) | ~192-bit (384-bit truncation) |
+| Domain separation | Built-in customization parameter (S) per SP 800-185 |
+| Output | 384 bits (48 bytes) → 64 base64 characters |
+| Construction | `Kmac::v512(key, customization).update(data).finalize(48 bytes)` |
+
+### Implementation details
+
+| Aspect | Detail |
+|--------|--------|
+| Library | `tiny-keccak` v2.0 with `kmac` feature — pure Rust, ~200 lines |
+| Streaming | File read in 8 KiB chunks via `std::io::Read` — never fully buffered |
+| Encoding | Base64 (standard alphabet, padded) via `base64` v0.22 |
+| Key input | Hex-decoded from CLI `--kmac-key` via `hex` v0.4 |
+| Customization | UTF-8 string from `--kmac-custom` (default: empty) |
+| Metadata key | `x-amz-meta-kmac512-384` (auto-prefixed by SDK) |
+
+### What the tag proves
+
+| Property | Verified? | Notes |
+|----------|-----------|-------|
+| **File integrity** | ✅ | Any modification to the file changes the KMAC output |
+| **Key authenticity** | ✅ | Only parties holding the key can produce a valid tag |
+| **Domain separation** | ✅ | Different `--kmac-custom` values produce different tags for the same file and key |
+| **Non-repudiation** | ❌ | KMAC is symmetric — any key holder can produce a tag (not a signature) |
+| **Confidentiality** | ❌ | KMAC does not encrypt — the file content is uploaded in cleartext (encrypted in transit by TLS) |
+
+### What the tag does NOT prove
+
+- **Who** computed the tag — any party with the key can produce it
+- **When** the tag was computed — no timestamp in the KMAC construction
+- **Server-side integrity** — the tag is attached as metadata, not verified by S3; the server stores it but does not validate it
+
+### Metadata persistence
+
+| Operation | Tag preserved? |
+|-----------|---------------|
+| `CopyObject` with `metadata_directive: COPY` | ✅ Yes |
+| `s3-mv` (server-side) | ✅ Yes (uses CopyObject) |
+| `CopyObject` with `metadata_directive: REPLACE` | ❌ No (all metadata replaced) |
+| Manual metadata update (`mc cp --attr ...` to self) | ❌ No (REPLACE directive) |
+| Object versioning | ✅ Each version retains its own metadata |
+
+### Key management considerations
+
+| Concern | Risk | Mitigation |
+|---------|------|------------|
+| Key on CLI | Visible in `/proc/PID/cmdline` and shell history | Use env vars (`KMAC_KEY=$(cat /path/to/keyfile) s3-put --kmac-key "$KMAC_KEY" ...`); planned: `--kmac-key-file` |
+| Key in memory | `String` on heap, not zeroed on drop | Short-lived CLI process; memory reclaimed on exit. Planned: `SecretString` for KMAC key |
+| Key rotation | Old tags remain valid with old key | Retain old keys for verification; re-tag objects after rotation if needed |
+| Key distribution | Shared secret must reach all verifiers | Use secrets managers (Azure Key Vault, HashiCorp Vault) |
+| Empty key | Valid per SP 800-185 but provides no keyed security | Document: use >= 32 bytes (256 bits) |
+
+### Zero-cost when unused
+
+When `--kmac-key` is not provided:
+
+- No KMAC computation occurs
+- No `x-amz-meta-kmac512-384` metadata is attached
+- `kmac512_384` is omitted from JSON output and audit records
+- `kmac_attached: false` in audit start record
+- Zero runtime cost — the KMAC code path is not executed
+- `tiny-keccak` code is compiled in but never called
 
 ---
 
@@ -253,7 +326,7 @@ is performed by the AWS SDK's `aws-sigv4` crate.  This applies to:
 | Part size (`--part-size-mib`) | Minimum size enforcement | >= 5 MiB (S3 spec) | CWE-20 |
 | Part count | Pre-upload validation | <= 10,000 (S3 spec) | CWE-400 |
 | Target parsing | Must contain alias + bucket (2+ segments) | Non-empty | CWE-20 |
-| Key resolution | Filename derived from source if target key is empty or ends with `/` | — | CWE-20 |
+| `--kmac-key` | Hex-decoded upfront | Fail-fast on invalid hex | CWE-20 |
 
 ### Not yet validated (backlog)
 
@@ -265,6 +338,7 @@ is performed by the AWS SDK's `aws-sigv4` crate.  This applies to:
 | Config key lengths | Min/max length bounds | CWE-20 |
 | Config file symlink | `O_NOFOLLOW` / `symlink_metadata()` check | CWE-59 |
 | Config file TOCTOU | `fstat()` after open | CWE-367 |
+| KMAC key minimum length | Warn if < 32 bytes | CWE-326 |
 
 ---
 
@@ -272,9 +346,8 @@ is performed by the AWS SDK's `aws-sigv4` crate.  This applies to:
 
 ### Stdout
 
-One JSON result record per invocation containing: status, source, bucket,
-key, size, etag, content_type, upload_method, parts (if multipart), and
-duration_ms.
+One JSON result record per invocation.  When `--kmac-key` is used,
+`kmac512_384` is included.  When not used, the field is omitted.
 
 ### Stderr
 
@@ -286,15 +359,15 @@ duration_ms.
 
 | `--verbose` | Behaviour |
 |-------------|-----------|
-| Off (default) | Error messages contain only the alias name and generic failure descriptions. Endpoint URLs, bucket names, key names, upload IDs, and alias lists are **not** disclosed. |
-| On | Full diagnostic detail including endpoint URL, bucket, key, upload ID, config path, and known alias list. Intended for operator troubleshooting only. |
+| Off (default) | Error messages contain only the alias name and generic failure descriptions. |
+| On | Full diagnostic detail including endpoint URL, bucket, key, upload ID, config path, and known alias list. |
 
 ### Exit codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Any error (config, network, permission, I/O, multipart failure) |
+| 1 | Any error (config, network, permission, I/O, multipart failure, invalid KMAC key) |
 
 ---
 
@@ -306,55 +379,29 @@ duration_ms.
 |-------|------|-------------|
 | `put_object_start` | After config load, before API call | stderr |
 | `put_object_complete` | After successful upload | stderr |
-| `multipart_abort` | When a part upload fails and AbortMultipartUpload is called | stderr |
+| `multipart_abort` | When a part upload fails | stderr |
 | `ca_bundle_loaded` | When `--ca-bundle` is used | stderr |
 | Error record | On any failure | stderr |
 
-### Correlation
+### KMAC in audit records
 
-All records within a single invocation share a `run_id` (UUID v7,
-timestamp-ordered) for log correlation.
+| Field | Record | Present when |
+|-------|--------|-------------|
+| `kmac_attached` | `put_object_start` | Always (boolean) |
+| `kmac512_384` | `put_object_complete` | Only when `--kmac-key` is used |
 
-### Fields included in audit records
-
-| Field | Start | Complete | Abort | Rationale |
-|-------|-------|----------|-------|-----------|
-| `event` | ✓ | ✓ | ✓ | Event type identification |
-| `run_id` | ✓ | ✓ | — | Session correlation (AU-3(1)) |
-| `alias` | ✓ | ✓ | — | Identity of credential set used |
-| `endpoint` | ✓ | — | — | Target service identification |
-| `bucket` | ✓ | ✓ | ✓ | Resource accessed |
-| `key` | ✓ | ✓ | ✓ | Object written |
-| `source` | ✓ | — | — | Local file path |
-| `file_size` | ✓ | — | — | Pre-upload size |
-| `upload_method` | ✓ | ✓ | — | `single` or `multipart` |
-| `content_type` | ✓ | — | — | MIME type used |
-| `region` | ✓ | — | — | Service region |
-| `path_style` | ✓ | — | — | Addressing mode |
-| `pq_kx` | ✓ | — | — | Key exchange algorithm offered |
-| `ca_bundle` | ✓ | — | — | Custom trust store indicator |
-| `size` | — | ✓ | — | Bytes uploaded |
-| `etag` | — | ✓ | — | Server-returned integrity tag |
-| `parts` | — | ✓ | — | Part count (multipart only) |
-| `duration_ms` | — | ✓ | — | Operation timing |
-| `outcome` | — | ✓ | — | Success/failure |
-| `upload_id` | — | — | ✓ | Multipart upload identifier |
+The KMAC **key** and **customization string** are **never** logged.
 
 ### Credentials in audit records
 
-**Never.** Access keys, secret keys, and session tokens are never included
-in any audit record, error message, or stdout output.
+**Never.** Access keys, secret keys, session tokens, and KMAC keys are
+never included in any audit record, error message, or stdout output.
 
 ### Log integrity
 
-Audit log integrity is an **operational responsibility**.  This application
-emits structured records; the consuming pipeline must enforce:
-
-- Write-once semantics (e.g., append-only storage)
-- Cryptographic log chaining or HMAC signing
-- Centralized collection with tamper detection
-
-Per NIST SP 800-53 AU-9 and PCI DSS 4.0 Req 10.3.2.
+Audit log integrity is an **operational responsibility**.  The consuming
+pipeline must enforce write-once semantics or cryptographic log chaining
+per NIST SP 800-53 AU-9 and PCI DSS 4.0 Req 10.3.2.
 
 ---
 
@@ -362,46 +409,23 @@ Per NIST SP 800-53 AU-9 and PCI DSS 4.0 Req 10.3.2.
 
 ### Abort on failure
 
-If any `UploadPart` call fails, the application:
+If any `UploadPart` call fails, the application calls
+`AbortMultipartUpload` to clean up.
 
-1. Emits a `multipart_abort` audit record to stderr with the `upload_id`,
-   `bucket`, and `key`.
-2. Calls `AbortMultipartUpload` to clean up the incomplete upload on the
-   server.
-3. Returns a contextual error to the caller.
+### KMAC metadata on multipart
 
-This prevents **orphaned multipart uploads** from consuming storage quota
-and potentially leaking partial data.
-
-### Part integrity
-
-Each `UploadPart` response includes an ETag.  The application collects
-all part ETags and submits them in the `CompleteMultipartUpload` request.
-The server validates that:
-
-- All declared parts are present.
-- Part numbers are sequential and 1-based.
-- ETags match the uploaded content.
-
-### Sequential upload
-
-Parts are uploaded **sequentially**, not in parallel.  This simplifies
-error handling and abort logic.  Parallel upload is planned for a future
-release with per-part retry and bounded concurrency.
-
-### Upload ID exposure
-
-The `upload_id` is emitted **only** in the `multipart_abort` audit record
-on stderr.  It is never included in stdout output.  In `--verbose` mode,
-it may appear in error messages for diagnostic purposes.
+The `x-amz-meta-kmac512-384` metadata is attached to the
+`CreateMultipartUpload` request.  S3 stores metadata at the object level,
+not per-part — so the tag is set once at creation and applies to the
+completed object.
 
 ### Residual risks
 
 | Risk | Description | Mitigation |
 |------|-------------|------------|
-| Orphaned uploads on process kill | If the process is killed (SIGKILL) during multipart upload, `AbortMultipartUpload` is not called | Configure S3 lifecycle rules to expire incomplete multipart uploads after N days |
-| No content checksum | Parts are not verified with SHA-256 / CRC32C | Planned for future release |
-| No retry on part failure | A single part failure aborts the entire upload | Planned: per-part retry with exponential backoff |
+| Orphaned uploads on SIGKILL | `AbortMultipartUpload` not called | S3 lifecycle rules |
+| No content checksum per part | Parts not verified with SHA-256/CRC32C | Planned |
+| No retry on part failure | Single failure aborts entire upload | Planned: per-part retry |
 
 ---
 
@@ -409,23 +433,14 @@ it may appear in error messages for diagnostic purposes.
 
 ### Source file access
 
-The application reads the source file via `ByteStream::from_path()` (single
-upload) or `ByteStream::read_from().offset().length()` (multipart).  Both
-methods stream from disk without buffering the entire file in memory.
+Streamed via `ByteStream::from_path()` (single) or
+`ByteStream::read_from().offset().length()` (multipart).
 
-### Content-type detection
+### KMAC file access
 
-Content-type is auto-detected from the file extension using a static mapping
-of common MIME types.  The `--content-type` flag overrides auto-detection.
-The extension-based mapping does not execute or inspect file contents.
-
-### Residual risks
-
-| Risk | CWE | Mitigation status |
-|------|-----|-------------------|
-| Symlink following on source file | CWE-59 | Not yet mitigated — source file symlinks are followed |
-| Symlink following on config file | CWE-59 | Not yet mitigated — planned |
-| TOCTOU between source stat and upload | CWE-367 | Low risk — source is read after stat; content change mid-upload would be detected by S3 ETag mismatch |
+Streamed via `std::fs::File` + `std::io::Read` in 8 KiB chunks.  The file
+is read **twice** when KMAC is enabled: once for the hash, once for the
+upload.  Both reads are streaming — the file is never fully buffered.
 
 ---
 
@@ -435,45 +450,29 @@ The extension-based mapping does not execute or inspect file contents.
 
 | Crate | Purpose | Risk notes |
 |-------|---------|------------|
-| `aws-sdk-s3` | S3 API client (PutObject, multipart) | AWS-maintained; high scrutiny |
+| `aws-sdk-s3` | S3 API client | AWS-maintained |
 | `aws-config` | Credential/region resolution | AWS-maintained |
 | `aws-smithy-http-client` | HTTP client builder | AWS-maintained |
-| `rustls` | TLS implementation | Memory-safe; no C code |
-| `aws-lc-rs` | Cryptographic provider | Wraps aws-lc (C); FIPS-validated variant available |
-| `secrecy` | Credential memory protection | Small, focused crate; well-audited |
-| `clap` | CLI argument parsing | Widely used; low risk |
-| `serde` / `serde_json` | Serialization | Widely used; low risk |
-| `tokio` | Async runtime | Widely used; high scrutiny |
+| `rustls` | TLS implementation | Memory-safe |
+| `aws-lc-rs` | Cryptographic provider | FIPS variant available |
+| `secrecy` | Credential memory protection | Well-audited |
+| `tiny-keccak` | KMAC512 (SP 800-185) | Pure Rust; ~200 lines; zero deps |
+| `base64` | Base64 encoding | Widely used |
+| `hex` | Hex decoding | Widely used |
+| `mimalloc` | Global allocator (secure mode) | Widely used |
+| `clap` | CLI parsing | Widely used |
+| `serde` / `serde_json` | Serialization | Widely used |
+| `tokio` | Async runtime | Widely used |
 | `dirs` | Home directory resolution | Small; portable |
-| `uuid` | UUID v7 generation | Widely used; low risk |
-| `anyhow` | Error handling | Widely used; low risk |
-
-### Required actions
-
-| Action | Tool | Frequency |
-|--------|------|-----------|
-| Vulnerability scanning | `cargo audit` | Every build (CI) |
-| License compliance | `cargo deny check licenses` | Every build (CI) |
-| SBOM generation | `cargo cyclonedx --format json` | Every release |
-| Binary signing | `cosign sign-blob` | Every release |
-| Dependency tree review | `cargo tree --duplicates` | Monthly |
+| `uuid` | UUID v7 generation | Widely used |
+| `anyhow` | Error handling | Widely used |
 
 ### Minimum dependency versions
-
-The following minimum versions must be enforced in `Cargo.lock` to
-address known CVEs:
 
 | Crate | Minimum version | Advisory |
 |-------|----------------|----------|
 | `aws-lc-sys` | 0.38.0 | CVE-2026-3336, CVE-2026-3337, CVE-2026-3338 |
 | `rustls-webpki` | 0.103.12 | RUSTSEC-2026-0099 |
-
-Add to CI:
-
-```bash
-cargo audit
-cargo deny check advisories
-```
 
 ---
 
@@ -491,24 +490,30 @@ cargo deny check advisories
 | 6 | CWE-400 | Part count and part size validation | — | ✅ Remediated |
 | 7 | CWE-209 | Error detail controlled by --verbose | — | ✅ Remediated |
 | 8 | CWE-295 | CA bundle adds to (not replaces) native roots | — | ✅ Remediated |
-| 9 | CWE-778 | Audit records with UUID v7 run_id (start, complete, abort) | — | ✅ Remediated |
-| 10 | — | Multipart abort on part failure prevents orphaned uploads | — | ✅ Remediated |
-| 11 | CWE-59 | No symlink validation on config or source path | Low | 🟡 Backlog |
-| 12 | CWE-367 | TOCTOU on config file and source file | Low | 🟡 Backlog |
-| 13 | CWE-20 | No schema validation on config field values | Low | 🟡 Backlog |
-| 14 | — | No content checksum (SHA-256/CRC32C) on upload | Medium | 🟠 Planned |
-| 15 | — | No per-part retry on multipart failure | Low | 🟡 Planned |
-| 16 | — | Orphaned uploads possible on SIGKILL | Low | 🟡 Operational (lifecycle rules) |
+| 9 | CWE-778 | Audit records with UUID v7 run_id | — | ✅ Remediated |
+| 10 | — | Multipart abort on part failure | — | ✅ Remediated |
+| 11 | CWE-20 | KMAC key hex validation fails fast | — | ✅ Remediated (v0.3.0) |
+| 12 | — | KMAC file streaming (8 KiB chunks, never buffered) | — | ✅ Remediated (v0.3.0) |
+| 13 | — | KMAC key and customization string never logged | — | ✅ Remediated (v0.3.0) |
+| 14 | — | Zero runtime cost when --kmac-key not used | — | ✅ Remediated (v0.3.0) |
+| 15 | CWE-214 | KMAC key visible in /proc/PID/cmdline | Low | 🟡 Accepted (v0.3.0) |
+| 16 | CWE-316 | KMAC key in memory as String (not zeroed on drop) | Low | 🟡 Accepted (v0.3.0) |
+| 17 | CWE-326 | No minimum KMAC key length enforced | Low | 🟡 Backlog |
+| 18 | CWE-59 | No symlink validation on config or source path | Low | 🟡 Backlog |
+| 19 | CWE-367 | TOCTOU on config file and source file | Low | 🟡 Backlog |
+| 20 | CWE-20 | No schema validation on config field values | Low | 🟡 Backlog |
+| 21 | — | No content checksum (SHA-256/CRC32C) on upload | Medium | 🟠 Planned |
+| 22 | — | No per-part retry on multipart failure | Low | 🟡 Planned |
 
 ### Dependency-level findings
 
 | # | CVE / Advisory | Crate | Severity | Applicability | Status |
 |---|---------------|-------|----------|--------------|--------|
-| 1 | CVE-2026-3336 | aws-lc | High | Not reachable (PKCS7_verify) | 🟠 Pin aws-lc-sys >= 0.38.0 |
-| 2 | CVE-2026-3338 | aws-lc | High | Not reachable (PKCS7_verify) | 🟠 Pin aws-lc-sys >= 0.38.0 |
-| 3 | CVE-2026-3337 | aws-lc | Medium | Not reachable (AES-CCM) | 🟠 Pin aws-lc-sys >= 0.38.0 |
-| 4 | CVE-2026-4428 | aws-lc | Medium | Relevant if CRL revocation is used | 🟠 Pin aws-lc-sys >= 0.38.0 |
-| 5 | RUSTSEC-2026-0099 | rustls-webpki | Medium | Relevant with name-constrained wildcard certs | 🟠 Pin rustls-webpki >= 0.103.12 |
+| 1 | CVE-2026-3336 | aws-lc | High | Not reachable | 🟠 Pin aws-lc-sys >= 0.38.0 |
+| 2 | CVE-2026-3338 | aws-lc | High | Not reachable | 🟠 Pin aws-lc-sys >= 0.38.0 |
+| 3 | CVE-2026-3337 | aws-lc | Medium | Not reachable | 🟠 Pin aws-lc-sys >= 0.38.0 |
+| 4 | CVE-2026-4428 | aws-lc | Medium | Relevant if CRL used | 🟠 Pin aws-lc-sys >= 0.38.0 |
+| 5 | RUSTSEC-2026-0099 | rustls-webpki | Medium | Relevant with wildcard certs | 🟠 Pin >= 0.103.12 |
 
 ---
 
@@ -520,16 +525,17 @@ cargo deny check advisories
 |---------|-------|----------------|
 | AC-3 | Access Enforcement | Config file permission check (0600) |
 | AU-2 | Event Logging | Startup, completion, and abort audit records |
-| AU-3 | Content of Audit Records | run_id, alias, bucket, key, size, duration, outcome, upload_id |
+| AU-3 | Content of Audit Records | run_id, alias, bucket, key, size, duration, outcome, kmac_attached, kmac512_384 |
 | AU-3(1) | Additional Audit Information | UUID v7 run_id for session correlation |
 | AU-9 | Protection of Audit Information | Operational — consuming pipeline responsibility |
 | AU-12 | Audit Record Generation | All operations emit structured JSONL to stderr |
 | IA-5(1) | Authenticator Management | SecretString zeroing; config permission enforcement |
 | SC-8(1) | Transmission Confidentiality | TLS 1.3 with X25519MLKEM768 |
 | SC-12 | Cryptographic Key Management | SecretString lifecycle; zeroed on drop |
-| SC-13 | Cryptographic Protection | aws-lc-rs; optional FIPS mode |
+| SC-13 | Cryptographic Protection | aws-lc-rs; optional FIPS mode; KMAC512-384 (SP 800-185) |
 | SI-2 | Flaw Remediation | cargo audit in CI; dependency pinning |
-| SI-10 | Information Input Validation | Target length, config size, CA size, part size/count |
+| SI-7 | Software/Data Integrity | KMAC512-384 integrity tag on uploaded objects |
+| SI-10 | Information Input Validation | Target length, config size, CA size, part size/count, KMAC key hex |
 | SI-11 | Error Handling | Verbose mode controls error detail disclosure |
 
 ### ISO 27001:2022
@@ -540,7 +546,7 @@ cargo deny check advisories
 | A.8.3 | Information Access Restriction | Config file 0600 |
 | A.8.9 | Configuration Management | Documented hardening checklist |
 | A.8.15 | Logging | JSONL audit records to stderr |
-| A.8.24 | Use of Cryptography | TLS 1.3, X25519MLKEM768, optional FIPS |
+| A.8.24 | Use of Cryptography | TLS 1.3, X25519MLKEM768, optional FIPS, KMAC512-384 |
 | A.8.28 | Secure Coding | Input validation, streaming I/O, error sanitization |
 
 ### PCI DSS 4.0
@@ -548,9 +554,9 @@ cargo deny check advisories
 | Requirement | Title | Implementation |
 |-------------|-------|----------------|
 | 2.2.1 | System Hardening Standards | Documented hardening checklist |
-| 2.2.7 | Non-console Admin Access Encryption | TLS 1.3 for all S3 communications |
+| 2.2.7 | Non-console Admin Access Encryption | TLS 1.3 |
 | 3.5.1 | Protect Stored Account Data | SecretString; config 0600 |
-| 4.2.1 | Strong Cryptography for Transmission | TLS 1.2+, X25519MLKEM768 preferred |
+| 4.2.1 | Strong Cryptography for Transmission | TLS 1.2+, X25519MLKEM768 |
 | 6.2.4 | Software Attack Prevention | Input validation, error sanitization |
 | 6.3.1 | Vulnerability Management | cargo audit; dependency pinning |
 | 6.3.2 | Software Inventory | SBOM via cargo-cyclonedx |
@@ -567,10 +573,10 @@ cargo deny check advisories
 | V-222425 | Enforce Approved Authorizations | Config permission check |
 | V-222457 | Generate Audit Records | JSONL audit records |
 | V-222458 | Session-Level Audit | UUID v7 run_id |
-| V-222542 | Protect Authenticator Integrity | SecretString zeroing |
-| V-222577 | DoD-Approved PKI Certificates | CA bundle support; platform-native roots |
+| V-222542 | Protect Authenticator Integrity | SecretString zeroing; KMAC key not logged |
+| V-222577 | DoD-Approved PKI Certificates | CA bundle support |
 | V-222596 | NSA-Approved Cryptography | Optional FIPS mode |
-| V-222607 | Validate All Input | Part size/count, config size, target length |
+| V-222607 | Validate All Input | Part size/count, config size, KMAC key hex |
 | V-222609 | Restrict Overly Long Input | Input length validation |
 | V-222610 | Enforce TLS 1.2 Minimum | rustls default; documented |
 
@@ -582,7 +588,7 @@ cargo deny check advisories
 | 3.11 | Encrypt Sensitive Data at Rest | SecretString; config 0600 |
 | 6.1 | Establish Access Granting Process | Config permission enforcement |
 | 8.2 | Collect Audit Logs | JSONL audit records to stderr |
-| 8.5 | Collect Detailed Audit Logs | Full metadata in audit records |
+| 8.5 | Collect Detailed Audit Logs | Full metadata including KMAC indicator |
 | 16.4 | Third-Party Software Inventory | SBOM via cargo-cyclonedx |
 | 16.6 | Secure Coding Practices | Input validation, error handling |
 
@@ -595,37 +601,41 @@ cargo deny check advisories
 - [ ] Config file permissions are `0600`: `chmod 600 ~/.mc/config.json`
 - [ ] Config file is owned by the service account running `s3-put`
 - [ ] `cargo audit` reports no unresolved advisories
+- [ ] `cargo deny check` passes
 - [ ] `aws-lc-sys` >= 0.38.0 in `Cargo.lock`
 - [ ] `rustls-webpki` >= 0.103.12 in `Cargo.lock`
-- [ ] SBOM generated and archived: `cargo cyclonedx --format json`
-- [ ] Release binary signed: `cosign sign-blob`
-- [ ] `--verbose` is **not** enabled in production automation scripts
-- [ ] Audit log pipeline is configured to collect stderr output
-- [ ] Audit log storage enforces write-once / append-only semantics
+- [ ] SBOM generated and archived
+- [ ] Release binary signed
+- [ ] `--verbose` is **not** enabled in production
+- [ ] Audit log pipeline collects stderr
+- [ ] Audit log storage enforces write-once / append-only
 - [ ] S3 bucket lifecycle rules expire incomplete multipart uploads
+
+### KMAC integrity tagging hygiene
+
+- [ ] KMAC key is >= 32 bytes (256 bits)
+- [ ] KMAC key is NOT hardcoded in scripts — use env vars or secrets manager
+- [ ] `--kmac-custom` uses a unique domain separator per pipeline/tenant
+- [ ] KMAC key is NOT visible in CI logs (mask in pipeline variables)
+- [ ] Verification procedure documented: `mc stat --json | jq .metadata`
+- [ ] Key rotation procedure documented: retain old keys for verification
+- [ ] Shell history does not persist KMAC key (`HISTCONTROL=ignorespace`)
 
 ### Runtime
 
 - [ ] Process runs under a dedicated, least-privilege service account
 - [ ] Process umask is set to `0027` or stricter
-- [ ] `HTTPS_PROXY` / `NO_PROXY` configured if network requires proxy
-- [ ] Source files are read from a directory with appropriate ACLs
-- [ ] HMAC keys are rotated at least every 90 days
-- [ ] `cargo audit` is run in CI on every build
-- [ ] Audit logs are reviewed at least weekly
+- [ ] `HTTPS_PROXY` / `NO_PROXY` configured if needed
+- [ ] HMAC keys rotated at least every 90 days
+- [ ] `cargo audit` run in CI on every build
+- [ ] Audit logs reviewed at least weekly
 
 ### FIPS environments
 
 - [ ] Built with `--features fips`
-- [ ] Go toolchain >= 1.22 available at build time
-- [ ] FIPS module version documented in deployment records
-- [ ] Cipher suites verified against approved list
-
-### Multipart upload hygiene
-
-- [ ] S3 bucket lifecycle rule: abort incomplete multipart uploads after 7 days
-- [ ] Monitor for orphaned multipart uploads via `ListMultipartUploads`
-- [ ] Alert on `multipart_abort` audit events in SIEM
+- [ ] Go toolchain >= 1.22 at build time
+- [ ] FIPS module version documented
+- [ ] Cipher suites verified
 
 ---
 
@@ -633,12 +643,15 @@ cargo deny check advisories
 
 | # | Risk | CWE | Justification | Review date |
 |---|------|-----|---------------|-------------|
-| 1 | `Credentials::new()` accepts `String` (not zeroed on drop) | CWE-316 | Upstream AWS SDK limitation. Short-lived CLI process; memory reclaimed on exit. Acceptable for CLI use; revisit if adapted to long-running service. | 2026-06-09 |
-| 2 | Static HMAC keys with no rotation enforcement | CWE-798 | Inherits MinIO Client config model. Documented as known limitation. Key rotation is an operational responsibility. | 2026-06-09 |
-| 3 | No symlink validation on config or source path | CWE-59 | Low risk for interactive CLI use under a dedicated service account. Planned for future hardening sprint. | 2026-06-09 |
-| 4 | No TOCTOU hardening on config file | CWE-367 | Low risk for short-lived CLI process. Planned for service-mode adaptation. | 2026-06-09 |
-| 5 | Orphaned multipart uploads on SIGKILL | — | Mitigated operationally via S3 lifecycle rules. Application calls AbortMultipartUpload on all caught errors. | 2026-06-09 |
-| 6 | Sequential part uploads (no parallelism) | — | Simplifies error handling and abort logic. Parallel upload planned for future release. Acceptable for current PoC/engineering use. | 2026-06-09 |
+| 1 | `Credentials::new()` accepts `String` (not zeroed) | CWE-316 | Upstream SDK limitation. Short-lived CLI. | 2026-06-09 |
+| 2 | Static HMAC keys with no rotation enforcement | CWE-798 | Inherits mc config model. Operational responsibility. | 2026-06-09 |
+| 3 | No symlink validation on config or source path | CWE-59 | Low risk for CLI under service account. Planned. | 2026-06-09 |
+| 4 | No TOCTOU hardening on config file | CWE-367 | Low risk for short-lived CLI. Planned. | 2026-06-09 |
+| 5 | Orphaned multipart uploads on SIGKILL | — | S3 lifecycle rules. AbortMultipartUpload on caught errors. | 2026-06-09 |
+| 6 | Sequential part uploads | — | Simplifies abort logic. Parallel planned. | 2026-06-09 |
+| 7 | KMAC key visible in /proc/PID/cmdline | CWE-214 | Short-lived CLI. Planned: `--kmac-key-file`. Use env vars in production. | 2026-06-09 |
+| 8 | KMAC key in memory as String (not zeroed) | CWE-316 | Short-lived CLI. Planned: `SecretString` for KMAC key. | 2026-06-09 |
+| 9 | No minimum KMAC key length enforced | CWE-326 | Documented: use >= 32 bytes. Planned: warning on short keys. | 2026-06-09 |
 
 ---
 
@@ -660,21 +673,56 @@ cargo deny check advisories
 |---|--------|---------------|--------|
 | 6 | Add `--fips` feature gate | SC-13 | 3 h |
 | 7 | Enforce TLS 1.2 minimum explicitly | SC-8(1) | 1 h |
-| 8 | Add config schema validation (URL, api, path, key lengths) | SI-10 | 2 h |
+| 8 | Add config schema validation | SI-10 | 2 h |
 | 9 | Add SHA-256 / CRC32C content checksum on upload | SI-7 | 3 h |
 | 10 | Add per-part retry with exponential backoff | — | 4 h |
+| 11 | Add `--kmac-key-file` flag (read key from file) | CWE-214 | 2 h |
+| 12 | Warn on KMAC key < 32 bytes | CWE-326 | 0.5 h |
 
 ### Sprint 3 — Hardening (defense-in-depth)
 
 | # | Action | CWE / Control | Effort |
 |---|--------|---------------|--------|
-| 11 | Symlink validation on config and source paths | CWE-59 | 2 h |
-| 12 | TOCTOU hardening with `O_NOFOLLOW` + `fstat()` | CWE-367 | 2 h |
-| 13 | Add `allowed_aliases` policy file | AC-3, AC-6 | 2 h |
-| 14 | Add STS / AssumeRole credential support | IA-5(1), SC-12 | 4 h |
-| 15 | Warn on stale config file (> 90 days) | SC-12 | 1 h |
-| 16 | Parallel multipart upload with bounded concurrency | — | 6 h |
-| 17 | Document recommended umask and service account setup | CM-6 | 1 h |
+| 13 | Symlink validation on config and source paths | CWE-59 | 2 h |
+| 14 | TOCTOU hardening with `O_NOFOLLOW` + `fstat()` | CWE-367 | 2 h |
+| 15 | Add `allowed_aliases` policy file | AC-3, AC-6 | 2 h |
+| 16 | Add STS / AssumeRole credential support | IA-5(1), SC-12 | 4 h |
+| 17 | Warn on stale config file (> 90 days) | SC-12 | 1 h |
+| 18 | Parallel multipart upload with bounded concurrency | — | 6 h |
+| 19 | Use `SecretString` for KMAC key in memory | CWE-316 | 2 h |
+| 20 | Document recommended service account setup | CM-6 | 1 h |
+
+---
+
+## Changelog (security-relevant)
+
+### v0.3.0 (2026-06-09)
+
+- **Added:** Optional KMAC512-384 integrity tagging via `--kmac-key` and
+  `--kmac-custom`.
+- **Added:** `tiny-keccak`, `base64`, `hex` dependencies.
+- **Added:** `kmac512_384` in output and audit records.
+- **Added:** `kmac_attached` in audit start record.
+- **Added:** KMAC512-384 Security Analysis section in SECURITY.md.
+- **Added:** KMAC key management guidance and hardening checklist items.
+- **Added:** `mimalloc` (secure mode) as global allocator.
+- **Security:** KMAC key hex validation fails fast (SI-10).
+- **Security:** File streamed through KMAC in 8 KiB chunks.
+- **Security:** KMAC key and customization string never logged.
+- **Security:** Zero runtime cost when `--kmac-key` not used.
+- **Accepted risks:** KMAC key visible in cmdline (CWE-214), KMAC key
+  not zeroed in memory (CWE-316), no minimum key length (CWE-326).
+
+### v0.2.0
+
+- Clippy-clean pass.
+- `UploadContext` struct.
+- `div_ceil` and `saturating_sub` fixes.
+- `rustfmt`-clean pass.
+
+### v0.1.0
+
+- Initial release.
 
 ---
 
