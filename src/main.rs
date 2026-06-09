@@ -587,32 +587,23 @@ async fn run() -> Result<()> {
     eprintln!("{}", serde_json::to_string(&audit_start)?);
 
     // ── 6. Upload ───────────────────────────────
+    let ctx = UploadContext {
+        client: &client,
+        bucket: &bucket,
+        key: &key,
+        source_path,
+        file_size,
+        content_type: &content_type,
+        storage_class: args.storage_class.as_deref(),
+        part_size,
+        verbose: args.verbose,
+        kmac_b64: kmac_b64.as_deref(),
+    };
+
     let (etag, parts_count) = if file_size > multipart_threshold {
-        let ctx = UploadContext {
-            client: &client,
-            bucket: &bucket,
-            key: &key,
-            source_path,
-            file_size,
-            content_type: &content_type,
-            storage_class: args.storage_class.as_deref(),
-            part_size,
-            verbose: args.verbose,
-            kmac_b64: kmac_b64.as_deref(),
-        };
         do_multipart_upload(&ctx).await?
     } else {
-        let etag = do_single_upload(
-            &client,
-            &bucket,
-            &key,
-            source_path,
-            &content_type,
-            args.storage_class.as_deref(),
-            kmac_b64.as_deref(),
-            args.verbose,
-        )
-        .await?;
+        let etag = do_single_upload(&ctx).await?;
         (etag, None)
     };
 
@@ -659,38 +650,30 @@ async fn run() -> Result<()> {
 //  Single-part upload (PutObject)
 // ──────────────────────────────────────────────
 
-async fn do_single_upload(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-    source_path: &Path,
-    content_type: &str,
-    storage_class: Option<&str>,
-    kmac_b64: Option<&str>,
-    verbose: bool,
-) -> Result<String> {
-    let body = ByteStream::from_path(source_path)
+async fn do_single_upload(ctx: &UploadContext<'_>) -> Result<String> {
+    let body = ByteStream::from_path(ctx.source_path)
         .await
-        .with_context(|| format!("failed to open {}", source_path.display()))?;
+        .with_context(|| format!("failed to open {}", ctx.source_path.display()))?;
 
-    let mut req = client
+    let mut req = ctx
+        .client
         .put_object()
-        .bucket(bucket)
-        .key(key)
-        .content_type(content_type)
+        .bucket(ctx.bucket)
+        .key(ctx.key)
+        .content_type(ctx.content_type)
         .body(body);
 
-    if let Some(sc) = storage_class {
+    if let Some(sc) = ctx.storage_class {
         req = req.storage_class(aws_sdk_s3::types::StorageClass::from(sc));
     }
 
-    if let Some(kmac) = kmac_b64 {
+    if let Some(kmac) = ctx.kmac_b64 {
         req = req.metadata("kmac256", kmac);
     }
 
     let resp = req.send().await.with_context(|| {
-        if verbose {
-            format!("PutObject failed: bucket={} key={}", bucket, key)
+        if ctx.verbose {
+            format!("PutObject failed: bucket={} key={}", ctx.bucket, ctx.key)
         } else {
             "PutObject request failed".to_string()
         }
