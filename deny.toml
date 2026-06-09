@@ -1,0 +1,129 @@
+# deny.toml — cargo-deny configuration for s3-put
+# ─────────────────────────────────────────────────────────────────────
+# Reference: https://embarkstudios.github.io/cargo-deny/checks/index.html
+# ─────────────────────────────────────────────────────────────────────
+# Last reviewed: 2026-06-09
+
+# ── General ──────────────────────────────────────────────────────────
+
+[graph]
+# Lint the entire dependency graph including build and dev dependencies.
+all-features = false
+no-default-features = false
+targets = [
+    "x86_64-unknown-linux-musl",
+]
+
+# ── Advisories ───────────────────────────────────────────────────────
+# Checks crates against the RustSec advisory database.
+
+[advisories]
+# Fail the build on any known vulnerability.
+vulnerability = "deny"
+# Warn on unmaintained crates (no release in > 1 year).
+unmaintained = "warn"
+# Warn on crates that have been yanked from crates.io.
+yanked = "warn"
+# Warn if the advisory database hasn't been updated recently.
+notice = "warn"
+# Ignore specific advisories (use sparingly, with justification).
+ignore = [
+    # Example:
+    # { id = "RUSTSEC-2026-XXXX", reason = "not reachable from our code" },
+]
+
+# ── Licenses ─────────────────────────────────────────────────────────
+# Controls which licenses are permitted in the dependency tree.
+#
+# The Rust/AWS ecosystem overwhelmingly uses MIT, Apache-2.0, and
+# BSD-variant licenses.  The list below covers every license observed
+# in the s3-put dependency tree as of June 2026.
+
+[licenses]
+# Fail on any crate with no detectable license.
+unlicensed = "deny"
+# Fail on any copyleft license (GPL, LGPL, AGPL, etc.).
+copyleft = "deny"
+# How to handle licenses not in the allow list.
+default = "deny"
+
+# Licenses that are explicitly permitted.
+allow = [
+    # ── Permissive (OSI-approved) ────────────────────────────────────
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+
+    # ── Unicode / ICU ────────────────────────────────────────────────
+    # Used by icu_*, tinystr, litemap, writeable, etc. in the AWS SDK
+    # internationalization stack.
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+
+    # ── OpenSSL (aws-lc-sys) ─────────────────────────────────────────
+    # aws-lc is dual-licensed Apache-2.0 OR ISC, but the sys crate
+    # bundles OpenSSL-derived code under the OpenSSL license.
+    "OpenSSL",
+
+    # ── Ring (historical) ────────────────────────────────────────────
+    # ring uses a custom ISC-style license that SPDX identifies as
+    # this.  It may appear in transitive deps even with aws-lc-rs.
+    "blessing",
+]
+
+# Some crates use non-standard license expressions or have licenses
+# that can't be automatically detected.  Clarify them here.
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# If a crate is dual-licensed (e.g., MIT OR Apache-2.0), cargo-deny
+# needs to know which license to evaluate.  This sets the preference
+# order.  We prefer Apache-2.0 for patent grant coverage.
+exceptions = [
+    # Example: if a specific crate needs an exception
+    # { allow = ["MPL-2.0"], name = "some-crate", version = "*" },
+]
+
+# ── Bans ─────────────────────────────────────────────────────────────
+# Ban specific crates or control duplicate versions.
+
+[bans]
+# Warn when multiple versions of the same crate are compiled.
+multiple-versions = "warn"
+# Warn on wildcard dependencies (e.g., version = "*").
+wildcards = "warn"
+# Highlight specific crates that should not be in the tree.
+deny = [
+    # Uncomment to enforce rustls-only TLS (ban OpenSSL bindings):
+    # { name = "openssl-sys", wrappers = [] },
+]
+# Allow specific duplicates that are known and acceptable.
+skip = [
+    # Example: two versions of itoa pulled by different SDK crates
+    # { name = "itoa", version = "0.4" },
+]
+skip-tree = [
+    # Example: skip duplicate checking under a known-heavy subtree
+    # { name = "aws-sdk-s3", version = "*" },
+]
+
+# ── Sources ──────────────────────────────────────────────────────────
+# Restrict where crates can be fetched from.
+
+[sources]
+# Deny crates from unknown registries.
+unknown-registry = "deny"
+# Deny crates fetched directly from git.
+unknown-git = "deny"
+# Only allow crates from the official crates.io registry.
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+]
+# No git sources allowed by default.
+allow-git = []
