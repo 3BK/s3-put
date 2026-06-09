@@ -28,6 +28,8 @@ rustls = { version = "0.23", features = [
     "prefer-post-quantum",      # X25519MLKEM768 highest-priority KX
 ] }
 
+aws-lc-sys = ">=0.38.0"
+
 # ── Runtime / serialization / CLI ────────────────────────────────
 tokio      = { version = "1", features = ["full"] }
 serde      = { version = "1", features = ["derive"] }
