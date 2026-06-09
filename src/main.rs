@@ -40,6 +40,7 @@ const MAX_TARGET_LEN: usize = 2048;
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024; // 5 MiB — S3 minimum
 const MAX_PARTS: u64 = 10_000; // S3 maximum
 const KMAC_READ_BUF: usize = 8192; // 8 KiB streaming hash buffer
+const KMAC256_OUTPUT_LEN: usize = 64; // 512 bits — standard output for KMAC256
 
 // ──────────────────────────────────────────────
 //  CLI
@@ -93,10 +94,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     verbose: bool,
 
-    /// KMAC512-384 key (hex-encoded) for computing x-amz-meta-kmac512-384.
-    /// If set, the file is hashed with KMAC512 truncated to 384 bits
-    /// before upload, and the base64-encoded result is attached as
-    /// object metadata.  If omitted, no KMAC is computed.
+    /// KMAC256 key (hex-encoded) for computing x-amz-meta-kmac256.
+    /// If set, the file is hashed with NIST SP 800-185 KMAC256
+    /// (standard 512-bit output) before upload, and the base64-encoded
+    /// result is attached as object metadata.
+    /// If omitted, no KMAC is computed.
     #[arg(long, value_name = "HEX_KEY")]
     kmac_key: Option<String>,
 
@@ -149,7 +151,7 @@ struct UploadRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     parts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    kmac512_384: Option<String>,
+    kmac256: Option<String>,
     duration_ms: u128,
 }
 
@@ -192,7 +194,7 @@ struct AuditCompleteRecord<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     parts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    kmac512_384: Option<&'a str>,
+    kmac256: Option<&'a str>,
     duration_ms: u128,
     outcome: &'static str,
 }
@@ -217,19 +219,22 @@ struct UploadContext<'a> {
 }
 
 // ──────────────────────────────────────────────
-//  KMAC512-384
+//  KMAC256 (NIST SP 800-185, standard 512-bit output)
 // ──────────────────────────────────────────────
 
-/// Compute KMAC512 truncated to 384 bits (48 bytes) over a file,
+/// Compute KMAC256 with standard 512-bit (64-byte) output over a file,
 /// returning the result as a base64-encoded string.
+///
+/// Uses NIST SP 800-185 KMAC256 (Keccak-512 based, 256-bit security).
+/// The output is the **standard** 512-bit length — no truncation.
 ///
 /// - `key`: the KMAC key (shared secret or per-pipeline key)
 /// - `customization`: SP 800-185 domain-separation string (S)
 /// - `path`: file to hash
 ///
 /// The file is streamed in 8 KiB chunks — never fully buffered.
-fn kmac512_384_file(key: &[u8], customization: &[u8], path: &Path) -> Result<String> {
-    let mut kmac = Kmac::v512(key, customization);
+fn kmac256_file(key: &[u8], customization: &[u8], path: &Path) -> Result<String> {
+    let mut kmac = Kmac::v256(key, customization);
 
     let mut file =
         std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
@@ -245,8 +250,8 @@ fn kmac512_384_file(key: &[u8], customization: &[u8], path: &Path) -> Result<Str
         kmac.update(&buf[..n]);
     }
 
-    // Finalize into 48 bytes (384 bits)
-    let mut output = [0u8; 48];
+    // Finalize into 64 bytes (512 bits) — standard KMAC256 output
+    let mut output = [0u8; KMAC256_OUTPUT_LEN];
     kmac.finalize(&mut output);
 
     Ok(BASE64.encode(output))
@@ -448,10 +453,10 @@ async fn run() -> Result<()> {
         }
     }
 
-    // ── Compute KMAC512-384 if requested ────────
+    // ── Compute KMAC256 if requested ────────────
     let kmac_b64 = if let Some(ref hex_key) = args.kmac_key {
         let key_bytes = hex::decode(hex_key).context("invalid hex in --kmac-key")?;
-        let b64 = kmac512_384_file(&key_bytes, args.kmac_custom.as_bytes(), source_path)?;
+        let b64 = kmac256_file(&key_bytes, args.kmac_custom.as_bytes(), source_path)?;
         Some(b64)
     } else {
         None
@@ -625,7 +630,7 @@ async fn run() -> Result<()> {
         content_type: content_type.clone(),
         upload_method: upload_method_label,
         parts: parts_count,
-        kmac512_384: kmac_b64.clone(),
+        kmac256: kmac_b64.clone(),
         duration_ms,
     };
     println!("{}", serde_json::to_string(&record)?);
@@ -641,7 +646,7 @@ async fn run() -> Result<()> {
         etag: &etag,
         upload_method: upload_method_label,
         parts: parts_count,
-        kmac512_384: kmac_b64.as_deref(),
+        kmac256: kmac_b64.as_deref(),
         duration_ms,
         outcome: "success",
     };
@@ -680,7 +685,7 @@ async fn do_single_upload(
     }
 
     if let Some(kmac) = kmac_b64 {
-        req = req.metadata("kmac512-384", kmac);
+        req = req.metadata("kmac256", kmac);
     }
 
     let resp = req.send().await.with_context(|| {
@@ -714,7 +719,7 @@ async fn do_multipart_upload(ctx: &UploadContext<'_>) -> Result<(String, Option<
     }
 
     if let Some(kmac) = ctx.kmac_b64 {
-        create_req = create_req.metadata("kmac512-384", kmac);
+        create_req = create_req.metadata("kmac256", kmac);
     }
 
     let create_resp = create_req.send().await.with_context(|| {
